@@ -1,6 +1,7 @@
 #define batteryPin 33
 #define ledPin 5
 #define dhtPin 13
+#define buzzer 18
 
 #define DHTTYPE DHT22
 

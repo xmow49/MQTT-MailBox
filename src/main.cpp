@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
+#include <Tone32.h>
 #include "esp_sleep.h"
 
 #include <config.h> //pins file
@@ -12,15 +13,15 @@ DHT dht(dhtPin, DHTTYPE); //dht temperature sensor
 WiFiClient espClient;           //Wifi
 PubSubClient client(espClient); //MQTT
 
-
 void go_deepSleep()
 {
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); //set pin to wake, here GPIO2 and 15. More info in config.h in "BUTTON_PIN_BITMASK"
   Serial.println("DeepSleep");
   delay(1000);
-  gpio_hold_en(GPIO_NUM_5);  //hold the current state of pin 5 durring the deepsleep (LED)
-  gpio_deep_sleep_hold_en(); //enable it
-  esp_deep_sleep_start();    //Start the deepsleep
+  gpio_hold_en(GPIO_NUM_5);                         //hold the current state of pin 5 durring the deepsleep (LED)
+  gpio_deep_sleep_hold_en();                        //enable it
+  esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
+  esp_deep_sleep_start();                           //Start the deepsleep
 }
 
 void ledBlink()
@@ -33,6 +34,19 @@ void ledBlink()
     digitalWrite(ledPin, LOW);
     delay(200);
   }
+}
+
+void melody()
+{
+  tone(buzzer, 523, 50, 0);
+  delay(50);
+  tone(buzzer, 783, 50, 0);
+  delay(50);
+  tone(buzzer, 1046, 50, 0);
+  delay(50);
+  tone(buzzer, 1568, 50, 0);
+  delay(50);
+  tone(buzzer, 2093, 70, 0);
 }
 
 void setup()
@@ -51,6 +65,7 @@ void setup()
   if (wake_GPIO == 2 || wake_GPIO == 15)
   {             //if the GPIO2 or 15 wake the ESP32, There is a mail
     ledBlink(); //LED to thanks the postman
+    melody(); //play sound
   }
 
   Serial.println("Connecting to ");
@@ -85,14 +100,14 @@ void setup()
   {
     Serial.println("Letter");
     client.publish(letter_topic, "ON"); //Send ON to MQTT topic
-    delay(200);
+    delay(1000);
     client.publish(letter_topic, "OFF"); //Send OFF to MQTT topic
   }
   else if (wake_GPIO == 15) //Parcel GPIO, there is a parcel
   {
     Serial.println("Parcel");
     client.publish(parcel_topic, "ON"); //Send ON to MQTT topic
-    delay(200);
+    delay(1000);
     client.publish(parcel_topic, "OFF"); //Send OFF to MQTT topic
   }
   else //Wake with reset button, or every 10 min for the monitoring
@@ -128,7 +143,6 @@ void setup()
   client.publish(wifi_topic, String(WiFi.RSSI()).c_str()); //Get RSSI (wifi strength)
   Serial.println(WiFi.RSSI());                             //Send it
 
-  esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
   go_deepSleep(); //return to deepsleep
 }
 void loop()
