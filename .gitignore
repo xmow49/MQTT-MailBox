@@ -1,6 +1,4 @@
 .pio
 .vscode
-lib
 include
 config.h
-test
