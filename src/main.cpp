@@ -9,9 +9,14 @@
 #include <esp_sleep.h>
 #include <EEPROM.h>
 #include <ESP32Time.h>
-#include "time.h"
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
 
+#include "time.h"
 #include "config.h" //pins file
+
+AsyncWebServer server(80);
 
 DHT dht(dhtPin, DHTTYPE); // dht temperature sensor
 
@@ -25,6 +30,7 @@ Adafruit_NeoPixel ledMerci(34, dataLedPin, NEO_GRB + NEO_KHZ800);
 
 TaskHandle_t statusLEDS;
 TaskHandle_t animationTask;
+TaskHandle_t MQTTTask;
 
 ESP32Time rtc(3600); // offset in seconds GMT+1
 
@@ -36,18 +42,25 @@ struct Config
 {
   char deepSleep = -1;
   int brightness = -1;
+  char avoidMultipleBoot = -1;
 };
 
 RTC_DATA_ATTR unsigned long lastBoot;
 RTC_DATA_ATTR unsigned long bootCount;
 RTC_DATA_ATTR Config config;
 
+RTC_DATA_ATTR float solar_energy_mWh = 0;
+RTC_DATA_ATTR float battery_energy_mWh = 0;
+
 bool animationState = false;
 
-void go_deepSleep()
+void turnOFFLedMerci()
 {
   if (animationState)
+  {
     vTaskDelete(animationTask);
+    animationState = false;
+  }
 
   ledMerci.setBrightness(0);
   ledMerci.clear();
@@ -56,13 +69,16 @@ void go_deepSleep()
   digitalWrite(powerLedPin, LOW);
   digitalWrite(dataLedPin, LOW);
   pinMode(dataLedPin, INPUT); // disable data led to cut the power (use the data pin as GND)
+}
+
+void go_deepSleep()
+{
+  turnOFFLedMerci();
   delay(100);
   // vTaskDelete(statusLEDS);
-  Serial.println("LED OFF");
-
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO2 and 15. More info in config.h in "BUTTON_PIN_BITMASK"
   Serial.println("DeepSleep");
-  delay(1000);
+  delay(500);
   gpio_hold_en(GPIO_NUM_32);                        // hold the current state of pin 32 durring the deepsleep (LED)
   gpio_deep_sleep_hold_en();                        // enable it
   esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
@@ -92,42 +108,6 @@ void statusLEDSTask(void *pvParameters)
   }
 }
 
-void rainbow(void *pvParameters)
-{
-  digitalWrite(powerLedPin, HIGH);
-  Serial.println("Rainbow");
-  ledMerci.begin();
-  static long time = 0;
-  time = millis() + 1000;
-  ledMerci.setBrightness(120);
-  for (long firstPixelHue = 0, i = 0; firstPixelHue < 5 * 65536; firstPixelHue += 256, i++)
-  {
-    ledMerci.rainbow(firstPixelHue);
-    if (i < ledMerci.numPixels())
-    {
-      for (int j = i + 1; j < ledMerci.numPixels(); j++)
-      {
-        ledMerci.setPixelColor(j, 0, 0, 0);
-      }
-      delay(50);
-    }
-    ledMerci.show(); // Update strip with new contents
-    delay(10);
-  }
-}
-
-void avoidMultipleBoot()
-{
-  if (rtc.getYear() != 1970)
-  {
-    if (lastBoot + 60 > rtc.getEpoch())
-    {
-      go_deepSleep();
-    }
-    lastBoot = rtc.getEpoch();
-  }
-}
-
 void sendPowerMeter()
 {
   float shuntvoltage = 0;
@@ -135,38 +115,111 @@ void sendPowerMeter()
   float current_mA = 0;
   float loadvoltage = 0;
   float power_mW = 0;
-  static float energy_mWh = 0;
 
   shuntvoltage = batteryMeter.getShuntVoltage_mV();
   busvoltage = batteryMeter.getBusVoltage_V();
   current_mA = batteryMeter.getCurrent_mA();
   power_mW = batteryMeter.getPower_mW();
   loadvoltage = busvoltage + (shuntvoltage / 1000);
-  energy_mWh = energy_mWh + (power_mW) * (1 / (60 * 60)); // 1s
 
-  client.publish("boiteAuxLettres/Batterybusvoltage", (String(busvoltage) + "V").c_str());
-  client.publish("boiteAuxLettres/Batteryshuntvoltage", (String(shuntvoltage) + "mV").c_str());
-  client.publish("boiteAuxLettres/Batteryloadvoltage", (String(loadvoltage) + "V").c_str());
-  client.publish("boiteAuxLettres/Batterycurrent_mA", (String(current_mA) + "mA").c_str());
-  client.publish("boiteAuxLettres/Batterypower_mW", (String(power_mW) + "mW").c_str());
-  client.publish("boiteAuxLettres/Batteryenergy_mWh", (String(energy_mWh) + "mWh").c_str());
+  int time = rtc.getEpoch() - lastBoot;
+  battery_energy_mWh = battery_energy_mWh + (power_mW) * (time / (60 * 60)); // 1s
+  lastBoot = rtc.getEpoch();
+
+  client.publish(battery_topic, String(busvoltage).c_str()); // Send it
+  client.publish("boiteAuxLettres/battery/busvoltage", (String(busvoltage) + "V").c_str());
+  // client.publish("boiteAuxLettres/battery/shuntvoltage", (String(shuntvoltage) + "mV").c_str());
+  // client.publish("boiteAuxLettres/battery/loadvoltage", (String(loadvoltage) + "V").c_str());
+  // client.publish("boiteAuxLettres/battery/current_mA", (String(current_mA) + "mA").c_str());
+  client.publish("boiteAuxLettres/battery/power_mW", (String(power_mW) + "mW").c_str());
+  client.publish("boiteAuxLettres/battery/energy_mWh", (String(battery_energy_mWh) + "mWh").c_str());
 
   shuntvoltage = solarMeter.getShuntVoltage_mV();
   busvoltage = solarMeter.getBusVoltage_V();
   current_mA = solarMeter.getCurrent_mA();
   power_mW = solarMeter.getPower_mW();
   loadvoltage = busvoltage + (shuntvoltage / 1000);
+  solar_energy_mWh = solar_energy_mWh + (power_mW) * (1 / (60 * 60)); // 1s
 
-  client.publish("boiteAuxLettres/Solarbusvoltage", (String(busvoltage) + "V").c_str());
-  client.publish("boiteAuxLettres/Solarshuntvoltage", (String(shuntvoltage) + "mV").c_str());
-  client.publish("boiteAuxLettres/Solarloadvoltage", (String(loadvoltage) + "V").c_str());
-  client.publish("boiteAuxLettres/Solarcurrent_mA", (String(current_mA) + "mA").c_str());
-  client.publish("boiteAuxLettres/Solarpower_mW", (String(power_mW) + "mW").c_str());
+  client.publish("boiteAuxLettres/solar/busvoltage", (String(busvoltage) + "V").c_str());
+  // client.publish("boiteAuxLettres/solar/shuntvoltage", (String(shuntvoltage) + "mV").c_str());
+  // client.publish("boiteAuxLettres/solar/loadvoltage", (String(loadvoltage) + "V").c_str());
+  client.publish("boiteAuxLettres/solar/current_mA", (String(current_mA) + "mA").c_str());
+  client.publish("boiteAuxLettres/solar/power_mW", (String(power_mW) + "mW").c_str());
+  client.publish("boiteAuxLettres/solar/energy_mWh", (String(solar_energy_mWh) + "mWh").c_str());
+
+  /*float battery = (analogRead(batteryPin) / (4095 / 3.3) / 0.785714); // Get Battery voltage: analogRead(batteryPin): 0->4095
+                                                                      //                      analogRead(batteryPin) / (4095 / 3.3): 0V->3.3V of analog pin
+                                                                      // 0.785714 is the ratio of the voltage divider bridge with 27k and 100K: 0V->4.2V
+  Serial.println("Battery level: " + String(battery) + "V");
+  Serial.println("Sending values...");*/
+}
+
+void rainbow(void *pvParameters)
+{
+  digitalWrite(powerLedPin, HIGH);
+  Serial.println("Rainbow");
+  ledMerci.begin();
+  ledMerci.setBrightness(120);
+  int i = 0;
+  unsigned long nextMillis = 0;
+  while (1)
+  {
+    for (long firstPixelHue = 0; firstPixelHue < 5 * 65536; firstPixelHue += 256, i++)
+    {
+      ledMerci.rainbow(firstPixelHue);
+      if (i < ledMerci.numPixels())
+      {
+        for (int j = i + 1; j < ledMerci.numPixels(); j++)
+        {
+          ledMerci.setPixelColor(j, 0, 0, 0);
+        }
+        delay(50);
+      }
+      ledMerci.show(); // Update strip with new contents
+      if (millis() > nextMillis)
+      {
+        nextMillis = millis() + 1000;
+        sendPowerMeter();
+      }
+      delay(10);
+    }
+  }
+}
+
+void avoidMultipleBoot()
+{
+  if (rtc.getYear() != 1970)
+  {    
+    if (lastBoot + 60 > rtc.getEpoch())
+    {
+      Serial.println("restart in 1 minute");
+      gpio_hold_en(GPIO_NUM_32);                        // hold the current state of pin 32 durring the deepsleep (LED)
+      gpio_deep_sleep_hold_en();                        // enable it
+      esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
+      esp_deep_sleep_start();
+    }
+    lastBoot = rtc.getEpoch();
+  }
+}
+
+void checkMQTTMessage(void *pvParameters)
+{
+  while (1)
+  {
+    client.loop();
+    delay(100);
+  }
+}
+
+void publishConfig()
+{
+  client.publish(config_deepsleep_topic, String((int)config.deepSleep).c_str());
+  client.publish(config_avoidMultipleBoot_topic, String((int)config.avoidMultipleBoot).c_str());
 }
 
 void newMQTTMessage(char *topic, byte *payload, unsigned int length)
 {
-
   if (strcmp(topic, config_deepsleep_topic) == 0)
   {
     switch ((char)payload[0])
@@ -180,20 +233,82 @@ void newMQTTMessage(char *topic, byte *payload, unsigned int length)
     default:
       break;
     }
-    Serial.print("DeepSleep: ");
-    Serial.println(config.deepSleep, DEC);
+    // Serial.print("DeepSleep: ");
+    // Serial.println(config.deepSleep, DEC);
+  }
+  if (strcmp(topic, config_avoidMultipleBoot_topic) == 0)
+  {
+    switch ((char)payload[0])
+    {
+    case '1':
+      config.avoidMultipleBoot = 1;
+      break;
+    case '0':
+      config.avoidMultipleBoot = 0;
+      break;
+    default:
+      break;
+    }
+    // Serial.print("AvoidMultipleBoot: ");
+    // Serial.println(config.avoidMultipleBoot, DEC);
   }
   EEPROM.put(0, config); // write config to EEPROM
   EEPROM.commit();
+}
+
+void sendGatesStates()
+{
+  client.publish(parcel_topic, (digitalRead(parcelPin) ? "1" : "0"));
+  client.publish(letter_topic, (digitalRead(letterPin) ? "1" : "0"));
+}
+
+void sendTemperature()
+{
+  dht.begin(); // Setup DHT
+
+  Serial.println("Reading Temperatures...");
+  int hum = dht.readHumidity();       // get temperature
+  float temp = dht.readTemperature(); // get humidity
+
+  // Display them:
+  Serial.println("Temperature: " + String(temp) + "°C");
+  Serial.println("Humidity: " + String(hum) + "%");
+
+  // Send them:
+  Serial.println("Sending values...");
+  client.publish(temp_topic, String(temp).c_str());
+  client.publish(hum_topic, String(hum).c_str());
+}
+
+void sendWifiInfos()
+{
+  Serial.println("Getting RSSI...");
+  client.publish(wifi_topic, String(WiFi.RSSI()).c_str()); // Get RSSI (wifi strength)
+  Serial.println(WiFi.RSSI());                             // Send it
+}
+
+void startOTAServer()
+{
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send(200, "text/plain", "Hi! I am ESP32."); });
+
+  AsyncElegantOTA.begin(&server); // Start ElegantOTA
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
 void setup()
 {
   String logs;
   bootCount++;
-  // avoidMultipleBoot();
 
   Serial.begin(115200);
+  if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1) //
+  {
+    avoidMultipleBoot();
+  }
+  lastBoot = rtc.getEpoch();
+
   uint64_t GPIO_reason = esp_sleep_get_ext1_wakeup_status(); // get the reason of wake
   int wake_GPIO = (log(GPIO_reason)) / log(2);
 
@@ -224,10 +339,10 @@ void setup()
       &statusLEDS,    /* Task handle to keep track of created task */
       0);             /* pin task to core 0 */
 
-  if (digitalRead(2))
-    wake_GPIO = 2;
-  else if (digitalRead(15))
-    wake_GPIO = 15;
+  if (digitalRead(letterPin))
+    wake_GPIO = letterPin;
+  else if (digitalRead(parcelPin))
+    wake_GPIO = parcelPin;
 
   if (!solarMeter.begin())
     logs += "Failed to initialize INA219 solarMeter\n";
@@ -239,7 +354,7 @@ void setup()
   EEPROM.begin(512);
   EEPROM.get(0, config); // read config from EEPROM
 
-  if (wake_GPIO == 2 || wake_GPIO == 15)
+  if (wake_GPIO == letterPin || wake_GPIO == parcelPin)
   {
     // if the GPIO2 or 15 wake the ESP32, There is a mail
     xTaskCreatePinnedToCore(
@@ -290,8 +405,18 @@ void setup()
   {
     client.setCallback(newMQTTMessage);
     client.subscribe(config_deepsleep_topic);
+    client.subscribe(config_avoidMultipleBoot_topic);
+
     Serial.println("connected to MQTT Server");
     logs += "Boot OK \n";
+    xTaskCreatePinnedToCore(
+        checkMQTTMessage, /* Task function. */
+        "Task3",          /* name of task. */
+        10000,            /* Stack size of task */
+        NULL,             /* parameter of the task */
+        2,                /* priority of the task */
+        &MQTTTask,        /* Task handle to keep track of created task */
+        0);
   }
   else
   {
@@ -300,70 +425,61 @@ void setup()
     go_deepSleep(); // error, go deepsleep
   }
 
-  if (wake_GPIO == 2) // Letter GPIO, there is a letter
+  if (wake_GPIO == letterPin) // Letter GPIO, there is a letter
   {
     Serial.println("Letter");
-    client.publish(letter_topic, "ON"); // Send ON to MQTT topic
+    client.publish(letter_topic, "1"); // Send ON to MQTT topic
     delay(200);
-    client.publish(letter_topic, "OFF"); // Send OFF to MQTT topic
+    client.publish(letter_topic, "0"); // Send OFF to MQTT topic
     logs += "Letter\n";
   }
-  else if (wake_GPIO == 15) // Parcel GPIO, there is a parcel
+  else if (wake_GPIO == parcelPin) // Parcel GPIO, there is a parcel
   {
     Serial.println("Parcel");
-    client.publish(parcel_topic, "ON"); // Send ON to MQTT topic
+    client.publish(parcel_topic, "1"); // Send ON to MQTT topic
     delay(200);
-    client.publish(parcel_topic, "OFF"); // Send OFF to MQTT topic
+    client.publish(parcel_topic, "0"); // Send OFF to MQTT topic
     logs += "Parcel\n";
   }
   else // Wake with reset button, or every 10 min for the monitoring
   {
     Serial.println("No Notif");
     logs += "No Notif\n";
+    sendTemperature(); // send temperature to MQTT server
   }
-
-  dht.begin(); // Setup DHT
-
-  Serial.println("Reading Temperatures...");
-  int hum = dht.readHumidity();     // get temperature
-  int temp = dht.readTemperature(); // get humidity
-
-  // Display them:
-  Serial.println("Temperature: " + String(temp) + "°C");
-  Serial.println("Humidity: " + String(hum) + "%");
-
-  // Send them:
-  Serial.println("Sending values...");
-  client.publish(temp_topic, String(temp).c_str());
-  client.publish(hum_topic, String(hum).c_str());
-
-  // Battery
-  Serial.println("Getting battery level...");
-  float battery = (analogRead(batteryPin) / (4095 / 3.3) / 0.785714); // Get Battery voltage: analogRead(batteryPin): 0->4095
-                                                                      //                      analogRead(batteryPin) / (4095 / 3.3): 0V->3.3V of analog pin
-                                                                      // 0.785714 is the ratio of the voltage divider bridge with 27k and 100K: 0V->4.2V
-  Serial.println("Battery level: " + String(battery) + "V");
-  Serial.println("Sending values...");
-  client.publish(battery_topic, String(battery).c_str()); // Send it
-
-  Serial.println("Getting RSSI...");
-  client.publish(wifi_topic, String(WiFi.RSSI()).c_str()); // Get RSSI (wifi strength)
-  Serial.println(WiFi.RSSI());                             // Send it
+  sendPowerMeter(); // send power meter to MQTT server
+  sendWifiInfos();  // send wifi infos to MQTT server
 
   client.publish("boiteAuxLettres/log", logs.c_str());
-
-  client.loop();                                       // Loop to check MQTT messages
+  
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
-    go_deepSleep();                                    // return to deepsleep
+  {
+    while (millis() < 10000)
+    {
+      delay(10);
+    }
+    publishConfig();
+    go_deepSleep(); // return to deepsleep
+  }
+
+  else
+    startOTAServer(); // start OTA server
 }
 
 void loop()
 {
+  if (millis() > 15000 && animationState) // if 30s passed and animation is running, stop it
+  {
+    turnOFFLedMerci();
+  }
   static unsigned long time = 0;
-  client.loop();
+  client.loop(); // MQTT loop
   if (millis() > time)
   {
     sendPowerMeter();
+    sendGatesStates();
     time = millis() + 1000;
+    if (config.deepSleep == 1 || config.deepSleep == -1)
+      go_deepSleep();
   }
 }
