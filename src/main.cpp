@@ -13,6 +13,8 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
+#include <ArduinoOTA.h>
+
 #include "time.h"
 #include "config.h" //pins file
 
@@ -73,8 +75,8 @@ void turnOFFLedMerci()
 
 void go_deepSleep()
 {
+  client.publish(loopState_topic, "0");
   turnOFFLedMerci();
-  delay(100);
   // vTaskDelete(statusLEDS);
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO2 and 15. More info in config.h in "BUTTON_PIN_BITMASK"
   Serial.println("DeepSleep");
@@ -113,14 +115,12 @@ void sendPowerMeter()
   float shuntvoltage = 0;
   float busvoltage = 0;
   float current_mA = 0;
-  float loadvoltage = 0;
   float power_mW = 0;
 
   shuntvoltage = batteryMeter.getShuntVoltage_mV();
   busvoltage = batteryMeter.getBusVoltage_V();
   current_mA = batteryMeter.getCurrent_mA();
   power_mW = batteryMeter.getPower_mW();
-  loadvoltage = busvoltage + (shuntvoltage / 1000);
 
   int time = rtc.getEpoch() - lastBoot;
   battery_energy_mWh = battery_energy_mWh + (power_mW) * (time / (60 * 60)); // 1s
@@ -138,7 +138,6 @@ void sendPowerMeter()
   busvoltage = solarMeter.getBusVoltage_V();
   current_mA = solarMeter.getCurrent_mA();
   power_mW = solarMeter.getPower_mW();
-  loadvoltage = busvoltage + (shuntvoltage / 1000);
   solar_energy_mWh = solar_energy_mWh + (power_mW) * (1 / (60 * 60)); // 1s
 
   client.publish("boiteAuxLettres/solar/busvoltage", (String(busvoltage) + "V").c_str());
@@ -165,7 +164,7 @@ void rainbow(void *pvParameters)
   unsigned long nextMillis = 0;
   while (1)
   {
-    for (long firstPixelHue = 0; firstPixelHue < 5 * 65536; firstPixelHue += 256, i++)
+    for (long firstPixelHue = 0; firstPixelHue < 5 * 65536 && animationState && millis() < 15000; firstPixelHue += 256, i++)
     {
       ledMerci.rainbow(firstPixelHue);
       if (i < ledMerci.numPixels())
@@ -184,18 +183,22 @@ void rainbow(void *pvParameters)
       }
       delay(10);
     }
+    if (millis() >= 15000 && animationState) // if 30s passed and animation is running, stop it
+    {
+      turnOFFLedMerci();
+    }
   }
 }
 
 void avoidMultipleBoot()
 {
   if (rtc.getYear() != 1970)
-  {    
+  {
     if (lastBoot + 60 > rtc.getEpoch())
     {
       Serial.println("restart in 1 minute");
-      gpio_hold_en(GPIO_NUM_32);                        // hold the current state of pin 32 durring the deepsleep (LED)
-      gpio_deep_sleep_hold_en();                        // enable it
+      gpio_hold_en(GPIO_NUM_32);                       // hold the current state of pin 32 durring the deepsleep (LED)
+      gpio_deep_sleep_hold_en();                       // enable it
       esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
       esp_deep_sleep_start();
     }
@@ -208,7 +211,7 @@ void checkMQTTMessage(void *pvParameters)
   while (1)
   {
     client.loop();
-    delay(100);
+    delay(1000);
   }
 }
 
@@ -276,8 +279,11 @@ void sendTemperature()
 
   // Send them:
   Serial.println("Sending values...");
-  client.publish(temp_topic, String(temp).c_str());
-  client.publish(hum_topic, String(hum).c_str());
+  if (!isnan(temp) && !isnan(hum))
+  {
+    client.publish(temp_topic, String(temp).c_str());
+    client.publish(hum_topic, String(hum).c_str());
+  }
 }
 
 void sendWifiInfos()
@@ -294,11 +300,55 @@ void startOTAServer()
 
   AsyncElegantOTA.begin(&server); // Start ElegantOTA
   server.begin();
+
+  ArduinoOTA.setHostname("BoiteAuxLettres"); // Set hostname for OTA
+  ArduinoOTA.setPassword(OTA_password);      // Set password for OTA
+  ArduinoOTA
+      .onStart([]()
+               {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type); })
+      .onEnd([]()
+             { Serial.println("\nEnd"); })
+      .onProgress([](unsigned int progress, unsigned int total)
+                  { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); })
+      .onError([](ota_error_t error)
+               {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed"); });
+
+  ArduinoOTA.begin();
+
   Serial.println("HTTP server started");
 }
 
 void setup()
 {
+  pinMode(parcelPin, INPUT_PULLUP);
+  pinMode(letterPin, INPUT_PULLUP);
+  pinMode(dataLedPin, INPUT); // temporary, to avoid data pin as GND
+
+  pinMode(parcelStatusPin, OUTPUT);
+  digitalWrite(parcelStatusPin, LOW);
+
+  pinMode(letterStatusPin, OUTPUT);
+  digitalWrite(letterStatusPin, LOW);
+
+  pinMode(powerLedPin, OUTPUT); // LED Pin is OUTPUT
+  digitalWrite(powerLedPin, LOW);
+
+  pinMode(buzzerPin, OUTPUT);
+
   String logs;
   bootCount++;
 
@@ -308,37 +358,22 @@ void setup()
     avoidMultipleBoot();
   }
   lastBoot = rtc.getEpoch();
-
-  uint64_t GPIO_reason = esp_sleep_get_ext1_wakeup_status(); // get the reason of wake
-  int wake_GPIO = (log(GPIO_reason)) / log(2);
-
+  // uint64_t GPIO_reason = esp_sleep_get_ext1_wakeup_status(); // get the reason of wake
   gpio_hold_dis(GPIO_NUM_32); // disable holding state of GPIO32
   gpio_deep_sleep_hold_dis(); // disbale holding
 
-  pinMode(parcelPin, INPUT_PULLUP);
-  pinMode(letterPin, INPUT_PULLUP);
-  pinMode(dataLedPin, INPUT); // temporary, to avoid data pin as GND
-
-  pinMode(parcelStatusPin, OUTPUT);
-  pinMode(letterStatusPin, OUTPUT);
-  pinMode(powerLedPin, OUTPUT); // LED Pin is OUTPUT
-  pinMode(buzzerPin, OUTPUT);
-
-  digitalWrite(parcelStatusPin, LOW);
-  digitalWrite(letterStatusPin, LOW);
-  digitalWrite(powerLedPin, LOW);
-
   ledcAttachPin(buzzerPin, 0);
+  // tskIDLE_PRIORITY
+  //  xTaskCreatePinnedToCore(
+  //      statusLEDSTask,   /* Task function. */
+  //      "StatusLED",          /* name of task. */
+  //      10000,            /* Stack size of task */
+  //      NULL,             /* parameter of the task */
+  //      32, /* priority of the task */
+  //      &statusLEDS,      /* Task handle to keep track of created task */
+  //      0);               /* pin task to core 0 */
 
-  xTaskCreatePinnedToCore(
-      statusLEDSTask, /* Task function. */
-      "Task1",        /* name of task. */
-      10000,          /* Stack size of task */
-      NULL,           /* parameter of the task */
-      1,              /* priority of the task */
-      &statusLEDS,    /* Task handle to keep track of created task */
-      0);             /* pin task to core 0 */
-
+  char wake_GPIO = 0;
   if (digitalRead(letterPin))
     wake_GPIO = letterPin;
   else if (digitalRead(parcelPin))
@@ -359,12 +394,12 @@ void setup()
     // if the GPIO2 or 15 wake the ESP32, There is a mail
     xTaskCreatePinnedToCore(
         rainbow,        /* Task function. */
-        "Task2",        /* name of task. */
+        "Rainbow",      /* name of task. */
         10000,          /* Stack size of task */
         NULL,           /* parameter of the task */
-        1,              /* priority of the task */
+        0,              /* priority of the task */
         &animationTask, /* Task handle to keep track of created task */
-        1);
+        0);
     animationState = true;
     melody(); // play sound
   }
@@ -411,12 +446,13 @@ void setup()
     logs += "Boot OK \n";
     xTaskCreatePinnedToCore(
         checkMQTTMessage, /* Task function. */
-        "Task3",          /* name of task. */
+        "MQTTLoop",       /* name of task. */
         10000,            /* Stack size of task */
         NULL,             /* parameter of the task */
-        2,                /* priority of the task */
+        90,               /* priority of the task */
         &MQTTTask,        /* Task handle to keep track of created task */
         0);
+    client.publish(bootCount_topic, String(bootCount).c_str());
   }
   else
   {
@@ -428,6 +464,8 @@ void setup()
   if (wake_GPIO == letterPin) // Letter GPIO, there is a letter
   {
     Serial.println("Letter");
+    client.publish(letter_topic, "0");
+    delay(200);
     client.publish(letter_topic, "1"); // Send ON to MQTT topic
     delay(200);
     client.publish(letter_topic, "0"); // Send OFF to MQTT topic
@@ -436,6 +474,8 @@ void setup()
   else if (wake_GPIO == parcelPin) // Parcel GPIO, there is a parcel
   {
     Serial.println("Parcel");
+    client.publish(parcel_topic, "0"); // Send ON to MQTT topic
+    delay(200);
     client.publish(parcel_topic, "1"); // Send ON to MQTT topic
     delay(200);
     client.publish(parcel_topic, "0"); // Send OFF to MQTT topic
@@ -451,29 +491,40 @@ void setup()
   sendWifiInfos();  // send wifi infos to MQTT server
 
   client.publish("boiteAuxLettres/log", logs.c_str());
-  
+
+  if (animationState)
+  {
+    while (millis() < 10000) // whait end of animation
+    {
+      delay(100);
+    }
+  }
+
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
   {
-    while (millis() < 10000)
-    {
-      delay(10);
-    }
     publishConfig();
     go_deepSleep(); // return to deepsleep
   }
 
   else
+  {
+    turnOFFLedMerci();
     startOTAServer(); // start OTA server
+    client.publish(loopState_topic, "1");
+  }
 }
 
 void loop()
 {
-  if (millis() > 15000 && animationState) // if 30s passed and animation is running, stop it
-  {
-    turnOFFLedMerci();
-  }
   static unsigned long time = 0;
+  digitalWrite(parcelStatusPin, digitalRead(parcelPin));
+  digitalWrite(letterStatusPin, digitalRead(letterPin));
   client.loop(); // MQTT loop
+
+  if (digitalRead(letterPin) || digitalRead(parcelPin))
+  {
+    ESP.restart();
+  }
   if (millis() > time)
   {
     sendPowerMeter();
@@ -482,4 +533,5 @@ void loop()
     if (config.deepSleep == 1 || config.deepSleep == -1)
       go_deepSleep();
   }
+  ArduinoOTA.handle();
 }
