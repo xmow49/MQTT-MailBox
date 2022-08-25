@@ -379,6 +379,8 @@ void startOTAServer()
   Serial.println("OTA started");
 }
 
+String logs;
+
 void setup()
 {
   pinMode(parcelPin, INPUT);
@@ -400,7 +402,6 @@ void setup()
   pinMode(powerINA219, OUTPUT); // Power INA219
   digitalWrite(powerINA219, HIGH);
 
-  String logs;
   bootCount++;
 
   Serial.begin(115200);
@@ -456,13 +457,17 @@ void setup()
   }
   TelnetStream.begin();
   Serial.println("WiFi connected");
+  IPAddress ip = WiFi.localIP();
+  Serial.println(ip);
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   struct tm timeinfo;
   if (rtc.getYear() == 1970)
   {
     logs += "RTC not set\n";
+    TelnetStream.println("RTC not set");
     Serial.println("Getting time...");
+    TelnetStream.println("Getting time...");
     if (getLocalTime(&timeinfo))
     {
       rtc.setTimeStruct(timeinfo);
@@ -471,6 +476,7 @@ void setup()
   }
   logs += "RTC set: " + rtc.getTime("%A, %B %d %Y %H:%M:%S") + "\n";
   Serial.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
+  TelnetStream.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
 
   client.setServer(mqtt_server, 1883);                             // Setup MQTT Server
   if (client.connect("BoiteAuxLettres", mqtt_user, mqtt_password)) // Connect to MQTT server
@@ -484,6 +490,7 @@ void setup()
     client.subscribe(config_pir_topic);
 
     Serial.println("connected to MQTT Server");
+    TelnetStream.println("connected to MQTT Server");
     logs += "Boot OK \n";
     client.publish(bootCount_topic, String(bootCount).c_str());
   }
@@ -491,12 +498,15 @@ void setup()
   {
     Serial.print("MQTT ERROR: ");
     Serial.println(client.state());
+    TelnetStream.print("MQTT ERROR: ");
+    TelnetStream.println(client.state());
     go_deepSleep(); // error, go deepsleep
   }
 
   if (wake_GPIO == letterPin) // Letter GPIO, there is a letter
   {
     Serial.println("Letter");
+    TelnetStream.println("Letter");
     client.publish(letter_topic, "0");
     delay(200);
     client.publish(letter_topic, "1"); // Send ON to MQTT topic
@@ -507,6 +517,7 @@ void setup()
   else if (wake_GPIO == parcelPin) // Parcel GPIO, there is a parcel
   {
     Serial.println("Parcel");
+    TelnetStream.println("Parcel");
     client.publish(parcel_topic, "0"); // Send ON to MQTT topic
     delay(200);
     client.publish(parcel_topic, "1"); // Send ON to MQTT topic
@@ -517,6 +528,7 @@ void setup()
   else if (wake_GPIO == pirPin) // Parcel GPIO, there is a parcel
   {
     Serial.println("PIR");
+    TelnetStream.println("PIR");
     client.publish(pir_topic, "0"); // Send ON to MQTT topic
     delay(200);
     client.publish(pir_topic, "1"); // Send ON to MQTT topic
@@ -527,6 +539,7 @@ void setup()
   else // Wake with reset button, or every 10 min for the monitoring
   {
     Serial.println("No Notif");
+    TelnetStream.println("No Notif");
     logs += "No Notif\n";
     sendTemperature(); // send temperature to MQTT server
   }
@@ -534,6 +547,7 @@ void setup()
   sendWifiInfos();  // send wifi infos to MQTT server
 
   client.publish("boiteAuxLettres/log", logs.c_str());
+  client.publish(IP_topic, ip.toString().c_str());
 
   if (animationState || wake_GPIO == pirPin)
   {
@@ -559,6 +573,7 @@ void setup()
       alreadyOpen = true;
     }
   }
+  TelnetStream.println(logs.c_str());
 }
 
 void loop()
@@ -577,11 +592,22 @@ void loop()
   if (millis() > time) // every 10s
   {
     Serial.println("Loop");
+    TelnetStream.println("Loop");
     sendGatesStates();                                   // send gates states to MQTT server
     sendPowerMeter();                                    // send power meter to MQTT server
     sendTemperature();                                   // send temperature to MQTT server
     time = millis() + 10000;                             // next time
     if (config.deepSleep == 1 || config.deepSleep == -1) // if deepsleep is enabled
       go_deepSleep();                                    // return to deepsleep
+  }
+  switch (TelnetStream.read())
+  {
+  case '\n':
+    TelnetStream.println("BoiteAuxLettres");
+    TelnetStream.println("L: Show startup logs");
+    break;
+  case 'L':
+    TelnetStream.println(logs.c_str());
+    break;
   }
 }
