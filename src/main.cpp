@@ -9,17 +9,12 @@
 #include <esp_sleep.h>
 #include <EEPROM.h>
 #include <ESP32Time.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncElegantOTA.h>
 #include <TelnetStream.h>
 
 #include <ArduinoOTA.h>
 
 #include "time.h"
 #include "config.h" //pins file
-
-AsyncWebServer server(80);
 
 DHT dht(dhtPin, DHTTYPE); // dht temperature sensor
 
@@ -30,10 +25,6 @@ Adafruit_INA219 solarMeter(0x40);
 Adafruit_INA219 batteryMeter(0x45);
 
 Adafruit_NeoPixel ledMerci(34, dataLedPin, NEO_GRB + NEO_KHZ800);
-
-TaskHandle_t statusLEDS;
-TaskHandle_t animationTask;
-TaskHandle_t MQTTTask;
 
 ESP32Time rtc(3600); // offset in seconds GMT+1
 
@@ -64,7 +55,6 @@ void turnOFFLedMerci()
 {
   if (animationState)
   {
-    vTaskDelete(animationTask);
     animationState = false;
   }
 
@@ -93,8 +83,8 @@ void go_deepSleep()
   }
   Serial.println("DeepSleep");
   delay(500);
-  gpio_hold_en(GPIO_NUM_32);                        // hold the current state of pin 32 durring the deepsleep (LED)
-  gpio_deep_sleep_hold_en();                        // enable it
+  gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
+  gpio_deep_sleep_hold_en(); // enable it
 
   esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
   esp_deep_sleep_start();                           // Start the deepsleep
@@ -113,14 +103,10 @@ void melody()
   tone(buzzerPin, 2093, 70, 0);
 }
 
-void statusLEDSTask(void *pvParameters)
+void statusLED()
 {
-  while (1)
-  {
-    digitalWrite(parcelStatusPin, digitalRead(parcelPin));
-    digitalWrite(letterStatusPin, digitalRead(letterPin));
-    delay(100);
-  }
+  digitalWrite(parcelStatusPin, digitalRead(parcelPin));
+  digitalWrite(letterStatusPin, digitalRead(letterPin));
 }
 
 void sendPowerMeter()
@@ -173,40 +159,49 @@ void sendPowerMeter()
   Serial.println("Sending values...");*/
 }
 
-void rainbow(void *pvParameters)
+void rainbow()
 {
-  digitalWrite(powerLedPin, HIGH);
-  Serial.println("Rainbow");
-  ledMerci.begin();
-  ledMerci.setBrightness(config.brightness);
-  int i = 0;
-  unsigned long nextMillis = 0;
-  while (1)
+  static bool firstRun = true;
+  static unsigned long nextMillis = 0;
+  static int i = 0;
+
+  static long firstPixelHue = 0;
+
+  if (firstRun)
   {
-    for (long firstPixelHue = 0; firstPixelHue < 5 * 65536 && animationState && millis() < 15000; firstPixelHue += 256, i++)
+    firstRun = false;
+    digitalWrite(powerLedPin, HIGH);
+    Serial.println("Rainbow");
+    ledMerci.begin();
+    ledMerci.setBrightness(config.brightness);
+  }
+  if (!(firstPixelHue < 5 * 65536 && animationState && millis() < 15000))
+  {
+    firstPixelHue = 0;
+  }
+  else
+  {
+
+    ledMerci.rainbow(firstPixelHue);
+    if (i < ledMerci.numPixels())
     {
-      ledMerci.rainbow(firstPixelHue);
-      if (i < ledMerci.numPixels())
+      for (int j = i + 1; j < ledMerci.numPixels(); j++)
       {
-        for (int j = i + 1; j < ledMerci.numPixels(); j++)
-        {
-          ledMerci.setPixelColor(j, 0, 0, 0);
-        }
-        delay(50);
+        ledMerci.setPixelColor(j, 0, 0, 0);
       }
-      ledMerci.show(); // Update strip with new contents
-      if (millis() > nextMillis)
-      {
-        nextMillis = millis() + 1000;
-        if (rtc.getYear() != 1970)
-          sendPowerMeter();
-      }
-      delay(10);
+      delay(50);
     }
-    if (millis() >= 15000 && animationState) // if 30s passed and animation is running, stop it
+    ledMerci.show(); // Update strip with new contents
+    if (millis() > nextMillis)
     {
-      turnOFFLedMerci();
+      nextMillis = millis() + 1000;
+      if (rtc.getYear() != 1970)
+        sendPowerMeter();
     }
+    delay(10);
+
+    firstPixelHue += 256;
+    i++;
   }
 }
 
@@ -217,8 +212,8 @@ void avoidMultipleBoot()
     if (lastBoot + 60 > rtc.getEpoch())
     {
       Serial.println("restart in 1 minute");
-      gpio_hold_en(GPIO_NUM_32);                       // hold the current state of pin 32 durring the deepsleep (LED)
-      gpio_deep_sleep_hold_en();                       // enable it
+      gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
+      gpio_deep_sleep_hold_en(); // enable it
       digitalWrite(powerINA219, LOW);
       esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
       esp_deep_sleep_start();
@@ -355,12 +350,6 @@ void sendWifiInfos()
 
 void startOTAServer()
 {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            { request->send(200, "text/plain", "Hi! I am ESP32."); });
-
-  AsyncElegantOTA.begin(&server); // Start ElegantOTA
-  server.begin();
-
   ArduinoOTA.setHostname("BoiteAuxLettres"); // Set hostname for OTA
   ArduinoOTA.setPassword(OTA_password);      // Set password for OTA
   ArduinoOTA
@@ -386,10 +375,8 @@ void startOTAServer()
       else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
       else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
       else if (error == OTA_END_ERROR) Serial.println("End Failed"); });
-
   ArduinoOTA.begin();
-
-  Serial.println("HTTP server started");
+  Serial.println("OTA started");
 }
 
 void setup()
@@ -424,32 +411,16 @@ void setup()
   lastBoot = rtc.getEpoch();
   // uint64_t GPIO_reason = esp_sleep_get_ext1_wakeup_status(); // get the reason of wake
 
-  // gpio_hold_dis(GPIO_NUM_32); // disable holding state of GPIO32
-  // gpio_deep_sleep_hold_dis(); // disbale holding
+  gpio_hold_dis(GPIO_NUM_32); // disable holding state of GPIO32
+  gpio_deep_sleep_hold_dis(); // disbale holding
 
   ledcAttachPin(buzzerPin, 0);
-  // tskIDLE_PRIORITY
-  //  xTaskCreatePinnedToCore(
-  //      statusLEDSTask,   /* Task function. */
-  //      "StatusLED",          /* name of task. */
-  //      10000,            /* Stack size of task */
-  //      NULL,             /* parameter of the task */
-  //      32, /* priority of the task */
-  //      &statusLEDS,      /* Task handle to keep track of created task */
-  //      0);               /* pin task to core 0 */
-
   auto WakeUP = log(esp_sleep_get_ext1_wakeup_status()) / log(2);
   char wake_GPIO = 0;
   if (WakeUP < 32)
   {
     wake_GPIO = (char)WakeUP;
   }
-
-  // if (digitalRead(letterPin))
-  //   wake_GPIO = letterPin;
-  // else if (digitalRead(parcelPin))
-  //   wake_GPIO = parcelPin;
-
   if (!solarMeter.begin())
     logs += "Failed to initialize INA219 solarMeter\n";
   if (!batteryMeter.begin())
@@ -463,15 +434,9 @@ void setup()
   if (wake_GPIO == letterPin || wake_GPIO == parcelPin)
   {
     // if the GPIO2 or 15 wake the ESP32, There is a mail
-    xTaskCreatePinnedToCore(
-        rainbow,        /* Task function. */
-        "Rainbow",      /* name of task. */
-        10000,          /* Stack size of task */
-        NULL,           /* parameter of the task */
-        1,              /* priority of the task */
-        &animationTask, /* Task handle to keep track of created task */
-        0);
     animationState = true;
+    rainbow();
+    statusLED();
     melody(); // play sound
   }
 
@@ -482,8 +447,8 @@ void setup()
   int beforeConnect = millis(); // Get time before begin to connect
   while (WiFi.status() != WL_CONNECTED)
   {
-    delay(500);
-    Serial.print(".");
+    rainbow();
+    statusLED();
     if (beforeConnect + 20000 < millis()) // Timeout of 30s
     {
       go_deepSleep(); // stop trying to connect and go deepsleep
@@ -520,14 +485,6 @@ void setup()
 
     Serial.println("connected to MQTT Server");
     logs += "Boot OK \n";
-    // xTaskCreatePinnedToCore(
-    //     checkMQTTMessage, /* Task function. */
-    //     "MQTTLoop",       /* name of task. */
-    //     10000,            /* Stack size of task */
-    //     NULL,             /* parameter of the task */
-    //     0,                /* priority of the task */
-    //     &MQTTTask,        /* Task handle to keep track of created task */
-    //     0);
     client.publish(bootCount_topic, String(bootCount).c_str());
   }
   else
@@ -582,17 +539,16 @@ void setup()
   {
     while (millis() < 15000) // whait end of animation
     {
+      rainbow();
+      statusLED();
       checkMQTTMessage();
-      delay(50);
     }
   }
-
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
   {
     publishConfig();
     go_deepSleep(); // return to deepsleep
   }
-
   else
   {
     turnOFFLedMerci();
@@ -603,12 +559,12 @@ void setup()
       alreadyOpen = true;
     }
   }
-  yield();
 }
 
 void loop()
 {
   static unsigned long time = 0;
+  statusLED();
   digitalWrite(parcelStatusPin, digitalRead(parcelPin)); // Update parcel status
   digitalWrite(letterStatusPin, digitalRead(letterPin)); // Update letter status
   client.loop();                                         // MQTT loop
@@ -620,6 +576,7 @@ void loop()
   }
   if (millis() > time) // every 10s
   {
+    Serial.println("Loop");
     sendGatesStates();                                   // send gates states to MQTT server
     sendPowerMeter();                                    // send power meter to MQTT server
     sendTemperature();                                   // send temperature to MQTT server
