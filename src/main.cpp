@@ -1,77 +1,39 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <PubSubClient.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_INA219.h>
-#include <Adafruit_NeoPixel.h>
-#include <DHT.h>
-#include <Tone32.h>
+
 #include <esp_sleep.h>
 #include <EEPROM.h>
 #include <ESP32Time.h>
 #include <TelnetStream.h>
 
-#include <ArduinoOTA.h>
+#include "status.h"
+#include "rainbow.h"
+#include "logs.h"
+#include "sensor.h"
+#include "buzzer.h"
+#include "ota.h"
+#include "mqtt.h"
 
 #include "time.h"
 #include "config.h" //pins file
 
-DHT dht(dhtPin, DHTTYPE); // dht temperature sensor
+ESP32Time rtc(GMT_OFFSET_SEC); // offset in seconds GMT+1
 
-WiFiClient espClient;           // Wifi
-PubSubClient client(espClient); // MQTT
-
-Adafruit_INA219 solarMeter(0x40);
-Adafruit_INA219 batteryMeter(0x45);
-
-Adafruit_NeoPixel ledMerci(34, dataLedPin, NEO_GRB + NEO_KHZ800);
-
-ESP32Time rtc(3600); // offset in seconds GMT+1
-
-const char *ntpServer = "192.168.2.50";
-const long gmtOffset_sec = 0;
-const int daylightOffset_sec = 3600;
-
-struct Config
-{
-  char deepSleep = -1;
-  char pir_sensor = -1;
-  int brightness = 100;
-  char avoidMultipleBoot = -1;
-};
-
-RTC_DATA_ATTR unsigned long lastBoot;
-RTC_DATA_ATTR unsigned long bootCount;
+RTC_DATA_ATTR uint32_t last_boot_time;
+RTC_DATA_ATTR uint32_t boot_count;
 RTC_DATA_ATTR Config config;
+RTC_DATA_ATTR gate_t gate_event_from_loop = GATE_UNKNOWN;
 
-RTC_DATA_ATTR float solar_energy_mWh = 0;
-RTC_DATA_ATTR float battery_energy_mWh = 0;
-RTC_DATA_ATTR float storage_energy_mWh = 0;
+bool already_open = false;
+static unsigned long loop_time_ms = 0;
+static unsigned long end_boot_time_ms = 0;
 
-bool animationState = false;
-bool alreadyOpen = false;
-String logs;
-
-void turnOFFLedMerci()
+void go_deep_sleep()
 {
-  if (animationState)
-  {
-    animationState = false;
-    ledMerci.setBrightness(0);
-    ledMerci.clear();
-    ledMerci.show();
-    delay(100);
-    digitalWrite(powerLedPin, LOW);
-    digitalWrite(dataLedPin, LOW);
-    pinMode(dataLedPin, INPUT); // disable data led to cut the power (use the data pin as GND)
-  }
-}
-
-void go_deepSleep()
-{
-  client.publish(loopState_topic, "0");
-  turnOFFLedMerci();
-  digitalWrite(powerINA219, LOW);
+  mqtt_send_loop_state(false);
+  rainbow_stop();
+  digitalWrite(PIN_POWER_INA219, LOW);
   if (config.pir_sensor == 1)
   {
     esp_sleep_enable_ext1_wakeup(BUTTON_AND_PIR_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO27 and 15. More info in config.h in "BUTTON_AND_PIR_BITMASK"
@@ -80,9 +42,8 @@ void go_deepSleep()
   {
     esp_sleep_enable_ext1_wakeup(BUTTON_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO27 and 15. More info in config.h in "BUTTON_BITMASK"
   }
-#if DEBUG
-  Serial.println("DeepSleep");
-#endif
+
+  logs("Going to deepsleep...\n");
   delay(500);
   gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
   gpio_deep_sleep_hold_en(); // enable it
@@ -91,649 +52,215 @@ void go_deepSleep()
   esp_deep_sleep_start();                           // Start the deepsleep
 }
 
-void melody()
+void avoid_multiple_boot()
 {
-  static unsigned char call = 0;
-  switch (call)
+  if (rtc.getYear() == 1970)
   {
-  case 0:
-    tone(buzzerPin, 523, 50, 0);
-    break;
-  case 1:
-    tone(buzzerPin, 783, 50, 0);
-    break;
-  case 2:
-    tone(buzzerPin, 1046, 50, 0);
-    break;
-  case 3:
-    tone(buzzerPin, 1568, 50, 0);
-    break;
-  case 4:
-    tone(buzzerPin, 2093, 70, 0);
-    break;
-
-  default:
-    break;
+    return; // RTC not initialized, we cannot avoid multiple boot
   }
 
-  call++;
-}
-
-void statusLED()
-{
-  digitalWrite(parcelStatusPin, digitalRead(parcelPin));
-  digitalWrite(letterStatusPin, digitalRead(letterPin));
-}
-
-void sendPowerMeter()
-{
-  float busvoltage = 0;
-  float current_mA = 0;
-  float power_mW = 0;
-  float newConsommation = 0;
-
-  busvoltage = batteryMeter.getBusVoltage_V();
-  current_mA = batteryMeter.getCurrent_mA();
-  power_mW = batteryMeter.getPower_mW();
-
-  int time = rtc.getEpoch() - lastBoot;
-  lastBoot = rtc.getEpoch();
-
-  if (busvoltage < 6.0) // security
+  if (last_boot_time + 60 > rtc.getEpoch())
   {
-    newConsommation = (deepSleepPower_mW) * ((float)time / (60 * 60)); // time s in deepsleep
-    float currentConsommation = (power_mW) * ((float)15 / (60 * 60));  // 15 sec of active
-    battery_energy_mWh = battery_energy_mWh + newConsommation + currentConsommation;
-    storage_energy_mWh -= newConsommation - currentConsommation;
-    client.publish(battery_voltage_topic, (String(busvoltage)).c_str());
-    client.publish(battery_current_topic, (String(current_mA)).c_str());
-    client.publish(battery_power_topic, (String(power_mW)).c_str());
-    client.publish(battery_energy_topic, (String(battery_energy_mWh)).c_str());
+    logs("Restart in 1 minute\n");
+    gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
+    gpio_deep_sleep_hold_en(); // enable it
+    digitalWrite(PIN_POWER_INA219, LOW);
+    esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
+    esp_deep_sleep_start();
   }
-
-  // shuntvoltage = solarMeter.getShuntVoltage_mV();
-  busvoltage = solarMeter.getBusVoltage_V();
-  current_mA = solarMeter.getCurrent_mA();
-  power_mW = solarMeter.getPower_mW();
-
-  if (busvoltage < 6.0)
-  {
-    newConsommation = (power_mW) * ((float)time / (60 * 60));
-    solar_energy_mWh = solar_energy_mWh + newConsommation;
-    storage_energy_mWh += newConsommation;
-    client.publish(solar_voltage_topic, (String(busvoltage)).c_str());
-    client.publish(solar_current_topic, (String(current_mA)).c_str());
-    client.publish(solar_power_topic, (String(power_mW)).c_str());
-    client.publish(solar_energy_topic, (String(solar_energy_mWh)).c_str());
-
-    client.publish(battery_charge_topic, (String(storage_energy_mWh)).c_str());
-  }
-
-  /*float battery = (analogRead(batteryPin) / (4095 / 3.3) / 0.785714); // Get Battery voltage: analogRead(batteryPin): 0->4095
-                                                                      //                      analogRead(batteryPin) / (4095 / 3.3): 0V->3.3V of analog pin
-                                                                      // 0.785714 is the ratio of the voltage divider bridge with 27k and 100K: 0V->4.2V
-  Serial.println("Battery level: " + String(battery) + "V");
-  Serial.println("Sending values...");*/
-}
-
-void rainbow()
-{
-  static bool firstRun = true;
-  static unsigned long nextMillis = 0;
-  static int i = 0;
-
-  static long firstPixelHue = 0;
-
-  if (firstRun)
-  {
-    firstRun = false;
-    digitalWrite(powerLedPin, HIGH);
-#if DEBUG
-    Serial.println("Rainbow");
-#endif
-    ledMerci.begin();
-    ledMerci.setBrightness(config.brightness);
-  }
-  if (!(firstPixelHue < 5 * 65536 && animationState && millis() < 15000))
-  {
-    firstPixelHue = 0;
-  }
-  else
-  {
-
-    ledMerci.rainbow(firstPixelHue);
-    if (i < ledMerci.numPixels())
-    {
-      for (int j = i + 1; j < ledMerci.numPixels(); j++)
-      {
-        ledMerci.setPixelColor(j, 0, 0, 0);
-      }
-      melody();
-      delay(50);
-    }
-    ledMerci.show(); // Update strip with new contents
-    if (millis() > nextMillis)
-    {
-      nextMillis = millis() + 1000;
-      if (rtc.getYear() != 1970)
-        sendPowerMeter();
-    }
-    delay(10);
-
-    firstPixelHue += 256;
-    i++;
-  }
-}
-
-void avoidMultipleBoot()
-{
-  if (rtc.getYear() != 1970)
-  {
-    if (lastBoot + 60 > rtc.getEpoch())
-    {
-#if DEBUG
-      Serial.println("restart in 1 minute");
-#endif
-      gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
-      gpio_deep_sleep_hold_en(); // enable it
-      digitalWrite(powerINA219, LOW);
-      esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
-      esp_deep_sleep_start();
-    }
-    lastBoot = rtc.getEpoch();
-  }
-}
-
-void checkMQTTMessage()
-{
-  client.loop();
-  yield();
-}
-
-void publishConfig()
-{
-  client.publish(config_deepsleep_topic, String((int)config.deepSleep).c_str());
-  client.publish(config_avoidMultipleBoot_topic, String((int)config.avoidMultipleBoot).c_str());
-}
-
-void newMQTTMessage(char *topic, byte *payload, unsigned int length)
-{
-  // Serial.println(topic);
-  if (strcmp(topic, config_deepsleep_topic) == 0)
-  {
-    switch ((char)payload[0])
-    {
-    case '1':
-      config.deepSleep = 1;
-      break;
-    case '0':
-      config.deepSleep = 0;
-      break;
-    default:
-      break;
-    }
-    // Serial.print("DeepSleep: ");
-    // Serial.println(config.deepSleep, DEC);
-  }
-  if (strcmp(topic, config_avoidMultipleBoot_topic) == 0)
-  {
-    switch ((char)payload[0])
-    {
-    case '1':
-      config.avoidMultipleBoot = 1;
-      break;
-    case '0':
-      config.avoidMultipleBoot = 0;
-      break;
-    default:
-      break;
-    }
-    // Serial.print("AvoidMultipleBoot: ");
-    // Serial.println(config.avoidMultipleBoot, DEC);
-  }
-  if (strcmp(topic, config_brightness_topic) == 0)
-  {
-    if (length > 3)
-      return;
-    if (length == 2)
-      payload[2] = '\0';
-    int value = atoi((char *)payload);
-    if (value < 0 || value > 255)
-      return;
-    config.brightness = value;
-#if DEBUG
-    Serial.print("Brightness: ");
-    Serial.println(config.brightness, DEC);
-#endif
-  }
-  if (strcmp(topic, config_charge_topic) == 0)
-  {
-    if (length > 5)
-      return;
-    if (length == 2)
-      for (int i = 2; i < 5; i++)
-        payload[i] = '\0';
-    int value = atoi((char *)payload);
-    storage_energy_mWh = (float)value;
-#if DEBUG
-    Serial.print("Charge: ");
-    Serial.println(storage_energy_mWh, DEC);
-#endif
-  }
-  if (strcmp(topic, config_pir_topic) == 0)
-  {
-    switch ((char)payload[0])
-    {
-    case '1':
-      config.pir_sensor = 1;
-      break;
-    case '0':
-      config.pir_sensor = 0;
-      break;
-    default:
-      break;
-    }
-    Serial.print("PIR: ");
-    Serial.println(config.pir_sensor, DEC);
-  }
-  if (strcmp(topic, config_reboot_topic) == 0)
-  {
-    switch ((char)payload[0])
-    {
-    case '1':
-      Serial.println("Reboot");
-      TelnetStream.println("Reboot");
-      ESP.restart();
-      break;
-    case '0':
-
-      break;
-    default:
-      break;
-    }
-#if DEBUG
-    Serial.print("PIR: ");
-    Serial.println(config.pir_sensor, DEC);
-#endif
-  }
-  EEPROM.put(0, config); // write config to EEPROM
-  EEPROM.commit();
-}
-
-void sendGatesStates()
-{
-  static char parcel = -1;
-  static char letter = -1;
-
-  char newParcel = digitalRead(parcelPin);
-  char newLetter = digitalRead(letterPin);
-
-  if (newParcel != parcel || parcel == -1)
-  {
-#if DEBUG
-    Serial.print("SEND PARCEL");
-#endif
-    parcel = newParcel;
-    client.publish(parcel_topic, newParcel ? "1" : "0");
-  }
-  if (newLetter != letter || letter == -1)
-  {
-    letter = newLetter;
-    client.publish(letter_topic, newLetter ? "1" : "0");
-  }
-}
-
-void sendTemperature()
-{
-  dht.begin(); // Setup DHT
-
-#if DEBUG
-  Serial.println("Reading Temperatures...");
-#endif
-  logs += "Reading Temperatures...\n";
-  int hum = dht.readHumidity();       // get temperature
-  float temp = dht.readTemperature(); // get humidity
-
-// Display them:
-#if DEBUG
-  Serial.println("Temperature: " + String(temp) + "°C");
-  Serial.println("Humidity: " + String(hum) + "%");
-#endif
-  logs += "Temperature: " + String(temp) + "°C\n";
-  logs += "Humidity: " + String(hum) + "%\n";
-
-// Send them:
-#if DEBUG
-  Serial.println("Sending values...");
-#endif
-  if (!isnan(temp) && !isnan(hum))
-  {
-    client.publish(temp_topic, String(temp).c_str());
-    client.publish(hum_topic, String(hum).c_str());
-  }
-}
-
-void sendWifiInfos()
-{
-#if DEBUG
-  Serial.println("Getting RSSI...");
-  Serial.println(WiFi.RSSI()); // Send it
-#endif
-  client.publish(wifi_topic, String(WiFi.RSSI()).c_str()); // Get RSSI (wifi strength)
-  TelnetStream.print("Getting RSSI...");
-  TelnetStream.println(WiFi.RSSI()); // Send it
-  TelnetStream.print("Getting BSSI...");
-  TelnetStream.println(WiFi.BSSIDstr()); // Send it
-}
-
-void startOTAServer()
-{
-  ArduinoOTA.setHostname("BoiteAuxLettres"); // Set hostname for OTA
-  ArduinoOTA.setPassword(OTA_password);      // Set password for OTA
-  ArduinoOTA
-      .onStart([]()
-               {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH)
-        type = "sketch";
-      else // U_SPIFFS
-        type = "filesystem";
-
-      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-      Serial.println("Start updating " + type); })
-      .onEnd([]()
-             { Serial.println("\nEnd"); })
-      .onProgress([](unsigned int progress, unsigned int total)
-                  { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); })
-      .onError([](ota_error_t error)
-               {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed"); });
-  ArduinoOTA.begin();
-#if DEBUG
-  Serial.println("OTA started");
-#endif
+  last_boot_time = rtc.getEpoch();
 }
 
 void setup()
 {
-  pinMode(parcelPin, INPUT);
-  pinMode(letterPin, INPUT);
-  pinMode(dataLedPin, INPUT); // temporary, to avoid data pin as GND
-  pinMode(pirPin, INPUT);     // temporary, to avoid data pin as GND
-
-  pinMode(parcelStatusPin, OUTPUT);
-  digitalWrite(parcelStatusPin, LOW);
-
-  pinMode(letterStatusPin, OUTPUT);
-  digitalWrite(letterStatusPin, LOW);
-
-  pinMode(powerLedPin, OUTPUT); // LED Pin is OUTPUT
-  digitalWrite(powerLedPin, LOW);
-
-  pinMode(buzzerPin, OUTPUT);
-
-  pinMode(powerINA219, OUTPUT); // Power INA219
-  digitalWrite(powerINA219, HIGH);
-
-  bootCount++;
-
-#if DEBUG
-  Serial.begin(115200);
-  Serial.println(millis());
-#endif
-
-  if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1) //
-  {
-    avoidMultipleBoot();
-  }
-
-  gpio_hold_dis(GPIO_NUM_32); // disable holding state of GPIO32
-  gpio_deep_sleep_hold_dis(); // disbale holding
-
-  ledcAttachPin(buzzerPin, 0);
-
-  auto WakeUP = log(esp_sleep_get_ext1_wakeup_status()) / log(2);
-  char wake_GPIO = 0;
-  if (WakeUP < 32)
-  {
-    wake_GPIO = (char)WakeUP;
-  }
-  if (!solarMeter.begin())
-    logs += "Failed to initialize INA219 solarMeter\n";
-  if (!batteryMeter.begin())
-    logs += "Failed to initialize INA219 batteryMeter\n";
-  solarMeter.setCalibration_32V_1A();
-  batteryMeter.setCalibration_32V_1A();
-
+  logs_init();
+  rainbow_init();
+  sensor_init();
+  buzzer_init();
+  status_led_init();
   EEPROM.begin(512);
   EEPROM.get(0, config); // read config from EEPROM
 
-  if (wake_GPIO == letterPin || wake_GPIO == parcelPin)
+  boot_count++;
+
+  if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1)
   {
-    // if the GPIO2 or 15 wake the ESP32, There is a mail
-    animationState = true;
-    statusLED();
-    unsigned long endMillis = millis() + 7000;
-    while (millis() < endMillis)
-    {
-      rainbow();
-    }
-    turnOFFLedMerci();
+    avoid_multiple_boot();
   }
 
-#if DEBUG
-  Serial.println("Connecting to ");
-  Serial.println(wifi_ssid);
-#endif
-  WiFi.begin(wifi_ssid, wifi_password); // Connect to the Wifi
+  char wake_GPIO = log(esp_sleep_get_ext1_wakeup_status()) / log(2);
+  if (wake_GPIO >= 32)
+  {
+    logs("Wake GPIO is not valid: %d\n", wake_GPIO);
+    wake_GPIO = 0;
+  }
 
-  int wifiTimeout = millis() + 20000; // Get time before begin to connect
+  if (wake_GPIO == PIN_LETTER || wake_GPIO == PIN_PARCEL)
+  {
+    rainbow_start();
+  }
+
+  logs("Connecting to %s", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Connect to the Wifi
+  int wifi_timeout = millis() + 20000;  // Get time before begin to connect
   while (WiFi.status() != WL_CONNECTED)
   {
-#if DEBUG
-    Serial.print(".");
-#endif
-    digitalWrite(parcelStatusPin, !digitalRead(parcelStatusPin));
-    // statusLED();
-    if (millis() > wifiTimeout) // Timeout of 30s
+    logs(".");
+    // digitalWrite(PIN_STATUS_PARCEL, !digitalRead(PIN_STATUS_PARCEL));
+    if (millis() > wifi_timeout) // Timeout of 30s
     {
-      go_deepSleep(); // stop trying to connect and go deepsleep
+      go_deep_sleep(); // stop trying to connect and go deepsleep
     }
     delay(500);
   }
 
-  for (int i = 0; i < 5; i++)
-  {
-    digitalWrite(parcelStatusPin, HIGH);
-    delay(100);
-    digitalWrite(parcelStatusPin, LOW);
-    delay(100);
-  }
-
-  TelnetStream.begin();
   IPAddress ip = WiFi.localIP();
-#if DEBUG
-  Serial.println("WiFi connected");
-  Serial.println(ip);
-#endif
+  logs("\nWiFi connected: %s\n", ip.toString().c_str());
+  TelnetStream.begin();
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   struct tm timeinfo;
   if (rtc.getYear() == 1970)
   {
-    logs += "RTC not set\n";
-    TelnetStream.println("RTC not set");
-#if DEBUG
-    Serial.println("Getting time...");
-#endif
-    TelnetStream.println("Getting time...");
+    logs("RTC not set, getting time from NTP server...\n");
+    logs("Getting time...\n");
     if (getLocalTime(&timeinfo))
     {
       rtc.setTimeStruct(timeinfo);
-      lastBoot = rtc.getEpoch();
+      last_boot_time = rtc.getEpoch();
     }
   }
   else
   {
-    lastBoot = rtc.getEpoch();
+    last_boot_time = rtc.getEpoch();
   }
-  logs += "RTC set: " + rtc.getTime("%A, %B %d %Y %H:%M:%S") + "\n";
-#if DEBUG
-  Serial.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
-#endif
-  TelnetStream.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
 
-  client.setServer(mqtt_server, 1883);                             // Setup MQTT Server
-  if (client.connect("BoiteAuxLettres", mqtt_user, mqtt_password)) // Connect to MQTT server
+  logs("RTC set: %s\n", rtc.getTime("%A, %B %d %Y %H:%M:%S").c_str());
+
+  int mqtt_state = mqtt_init();
+  if (mqtt_state == 0)
   {
-
-    client.setCallback(newMQTTMessage);
-    client.subscribe(config_deepsleep_topic);
-    client.subscribe(config_avoidMultipleBoot_topic);
-    client.subscribe(config_brightness_topic);
-    client.subscribe(config_charge_topic);
-    client.subscribe(config_pir_topic);
-    client.subscribe(config_reboot_topic);
-#if DEBUG
-    Serial.println("connected to MQTT Server");
-#endif
-    TelnetStream.println("connected to MQTT Server");
-    logs += "Boot OK \n";
-    client.publish(bootCount_topic, String(bootCount).c_str());
+    logs("Connected to MQTT Server\n");
+    logs("Boot OK \n");
   }
   else
   {
-#if DEBUG
-    Serial.print("MQTT ERROR: ");
-    Serial.println(client.state());
-#endif
-    TelnetStream.print("MQTT ERROR: ");
-    TelnetStream.println(client.state());
-    go_deepSleep(); // error, go deepsleep
+    logs("MQTT ERROR: %d bye\n", mqtt_state);
+    go_deep_sleep(); // error, go deepsleep
   }
 
-  if (wake_GPIO == letterPin) // Letter GPIO, there is a letter
+  mqtt_send_boot_count(boot_count);
+
+  gate_t gate = GATE_UNKNOWN;
+  switch (wake_GPIO)
   {
-#if DEBUG
-    Serial.println("Letter");
-#endif
-    TelnetStream.println("Letter");
-    client.publish(letter_topic, "0");
-    delay(200);
-    client.publish(letter_topic, "1"); // Send ON to MQTT topic
-    delay(200);
-    client.publish(letter_topic, "0"); // Send OFF to MQTT topic
-    logs += "Letter\n";
+  case PIN_LETTER:
+    gate = GATE_LETTER;
+    break;
+  case PIN_PARCEL:
+    gate = GATE_PARCEL;
+    break;
+  case PIN_PIR:
+    gate = GATE_PIR;
+    break;
+  default:
+    if (gate_event_from_loop < GATE_UNKNOWN)
+    {
+      logs("Wake event from loop: %d\n", gate_event_from_loop);
+      gate = gate_event_from_loop;
+    }
+    break;
   }
-  else if (wake_GPIO == parcelPin) // Parcel GPIO, there is a parcel
+
+  if (gate != GATE_UNKNOWN)
   {
-#if DEBUG
-    Serial.println("Parcel");
-#endif
-    TelnetStream.println("Parcel");
-    client.publish(parcel_topic, "0"); // Send ON to MQTT topic
+    mqtt_sent_gate(gate, true); // Send ON to MQTT topic
     delay(200);
-    client.publish(parcel_topic, "1"); // Send ON to MQTT topic
-    delay(200);
-    client.publish(parcel_topic, "0"); // Send OFF to MQTT topic
-    logs += "Parcel\n";
-  }
-  else if (wake_GPIO == pirPin) // Parcel GPIO, there is a parcel
-  {
-#if DEBUG
-    Serial.println("PIR");
-#endif
-    TelnetStream.println("PIR");
-    client.publish(pir_topic, "0"); // Send ON to MQTT topic
-    delay(200);
-    client.publish(pir_topic, "1"); // Send ON to MQTT topic
-    delay(200);
-    client.publish(pir_topic, "0"); // Send OFF to MQTT topic
-    logs += "PIR\n";
+    mqtt_sent_gate(gate, false); // Send OFF to MQTT topic
   }
   else // Wake with reset button, or every 10 min for the monitoring
   {
-#if DEBUG
-    Serial.println("No Notif");
-#endif
-    TelnetStream.println("No Notif");
-    logs += "No Notif\n";
+    logs("No Notif\n");
   }
-  sendTemperature(); // send temperature to MQTT server
-  sendPowerMeter();  // send power meter to MQTT server
-  sendWifiInfos();   // send wifi infos to MQTT server
 
-  client.publish("boiteAuxLettres/log", logs.c_str());
-  client.publish(IP_topic, ip.toString().c_str());
-
-  unsigned long endMillis = millis() + 3000;
-  if (wake_GPIO == pirPin)
-    endMillis += 12000; // 15s total for PIR
-
-  while (millis() < endMillis) // wait a bit
-  {
-    checkMQTTMessage();
-    statusLED();
-  }
+  sensor_send_values();   // send sensor values to MQTT server
+  mqtt_send_wifi_infos(); // send wifi infos to MQTT server
+  delay(3000);            // wait a bit before going to deepsleep
 
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
   {
-    publishConfig();
-    go_deepSleep(); // return to deepsleep
+    mqtt_publish_config();
+    go_deep_sleep(); // return to deepsleep
   }
   else
   {
-    turnOFFLedMerci();
-    startOTAServer(); // start OTA server
-    client.publish(loopState_topic, "1");
-    if (digitalRead(letterPin) || digitalRead(parcelPin))
+    rainbow_stop();
+    ota_start_server();
+    mqtt_send_loop_state(true);
+
+    if (digitalRead(PIN_LETTER) || digitalRead(PIN_PARCEL))
     {
-      alreadyOpen = true;
+      already_open = true;
     }
   }
-  TelnetStream.println(logs.c_str());
+
+  end_boot_time_ms = millis();
 }
 
 void loop()
 {
-  static unsigned long time = 0;
-  statusLED();
-  digitalWrite(parcelStatusPin, digitalRead(parcelPin)); // Update parcel status
-  digitalWrite(letterStatusPin, digitalRead(letterPin)); // Update letter status
-  client.loop();                                         // MQTT loop
-  ArduinoOTA.handle();                                   // OTA loop
-
-  if ((digitalRead(letterPin) || digitalRead(parcelPin)) && !alreadyOpen) // if any detection, restart to process
+  bool parcel = digitalRead(PIN_PARCEL);
+  bool letter = digitalRead(PIN_LETTER);
+  if ((letter || parcel) && !already_open) // if any detection, restart to process
   {
+    gate_event_from_loop = (letter ? GATE_LETTER : GATE_PARCEL);
+    logs("Detected %s, restarting...\n", (letter ? "letter" : "parcel"));
     ESP.restart();
   }
-  sendGatesStates();   // send gates states to MQTT server
-  if (millis() > time) // every 10s
+
+  sensor_send_gates_states(); // send gates states to MQTT server
+
+  if (millis() > loop_time_ms) // every 10s
   {
-#if DEBUG
-    Serial.println("Loop");
-#endif
-    TelnetStream.println("Loop");
-    sendPowerMeter();                                    // send power meter to MQTT server
-    sendTemperature();                                   // send temperature to MQTT server
-    sendWifiInfos();                                     // send wifi infos to MQTT server
-    time = millis() + 10000;                             // next time
+    logs("Loop\n");
+    sensor_send_values();
+    mqtt_send_wifi_infos();
+    loop_time_ms = millis() + 10000;
+
     if (config.deepSleep == 1 || config.deepSleep == -1) // if deepsleep is enabled
-      go_deepSleep();                                    // return to deepsleep
+    {
+      go_deep_sleep(); // return to deepsleep
+    }
+
+    if (millis() - end_boot_time_ms > LOOP_TIMEOUT_MIN * 60 * 1000)
+    {
+      logs("Loop timeout, restarting...\n");
+      ESP.restart(); // Restart if loop is too long
+    }
   }
-  switch (TelnetStream.read())
+
+  if (TelnetStream.available()) // if there is data on TelnetStream
   {
-  case '\n':
-    TelnetStream.println("BoiteAuxLettres");
-    TelnetStream.println("L: Show startup logs");
-    break;
-  case 'L':
-    TelnetStream.println(logs.c_str());
-    break;
+    char c = TelnetStream.read();
+    switch (c)
+    {
+    case '\n':
+      TelnetStream.println("BoiteAuxLettres");
+      TelnetStream.println("L: Show startup logs");
+      TelnetStream.println("R: Start rainbow");
+      TelnetStream.println("S: Stop rainbow");
+      break;
+    case 'L':
+      TelnetStream.println(logs_get_buffer(false));
+      break;
+    case 'R':
+      rainbow_start();
+      break;
+    case 'S':
+      rainbow_stop();
+      break;
+    default:
+      break;
+    }
   }
 }
