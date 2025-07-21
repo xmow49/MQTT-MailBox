@@ -53,8 +53,7 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
         default:
             break;
         }
-        // Serial.print("DeepSleep: ");
-        // Serial.println(config.deepSleep, DEC);
+        logs("New deepsleep config: %d\n", config.deepSleep);
     }
     if (strcmp(topic, TOPIC_CONFIG_AVOID_MULTIPLE_BOOT) == 0)
     {
@@ -69,8 +68,7 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
         default:
             break;
         }
-        // Serial.print("AvoidMultipleBoot: ");
-        // Serial.println(config.avoidMultipleBoot, DEC);
+        logs("New avoid multiple boot config: %d\n", config.avoidMultipleBoot);
     }
     if (strcmp(topic, TOPIC_CONFIG_BRIGHTNESS) == 0)
     {
@@ -82,7 +80,7 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
         if (value < 0 || value > 255)
             return;
         config.brightness = value;
-        logs("Brightness: %d\n", config.brightness);
+        logs("New brightness config: %d\n", config.brightness);
     }
     if (strcmp(topic, TOPIC_CONFIG_CHARGE) == 0)
     {
@@ -93,7 +91,7 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
                 payload[i] = '\0';
         uint32_t value = atoi((char *)payload);
         sensor_set_charge(value);
-        logs("Charge: %d\n", value);
+        logs("New charge config: %d\n", value);
     }
     if (strcmp(topic, TOPIC_CONFIG_PIR) == 0)
     {
@@ -108,7 +106,7 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
         default:
             break;
         }
-        // logs("PIR: %d\n", config.pir_sensor);
+        logs("New PIR config: %d\n", config.pir_sensor);
     }
     if (strcmp(topic, TOPIC_CONFIG_REBOOT) == 0)
     {
@@ -123,7 +121,6 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
         default:
             break;
         }
-        logs("PIR enabled: %d\n", config.pir_sensor);
     }
     EEPROM.put(0, config); // write config to EEPROM
     EEPROM.commit();
@@ -149,12 +146,6 @@ void mqtt_sent_gate(gate_t gate, bool state)
     }
 
     mqtt_client.publish(topic, state ? "1" : "0"); // Send ON or OFF to MQTT topic
-
-    // mqtt_client.publish(topic, "0");
-    // delay(200);
-    // mqtt_client.publish(topic, "1"); // Send ON to MQTT topic
-    // delay(200);
-    // mqtt_client.publish(topic, "0"); // Send OFF to MQTT topic
 }
 
 void mqtt_publish_config()

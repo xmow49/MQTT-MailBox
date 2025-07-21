@@ -152,6 +152,7 @@ void setup()
   mqtt_send_boot_count(boot_count);
 
   gate_t gate = GATE_UNKNOWN;
+  logs("Wake GPIO: %d\n", wake_GPIO);
   switch (wake_GPIO)
   {
   case PIN_LETTER:
@@ -172,8 +173,12 @@ void setup()
     break;
   }
 
+  logs("Gate: %d\n", gate);
+
   if (gate != GATE_UNKNOWN)
   {
+    mqtt_sent_gate(gate, false); // Send OFF to MQTT topic
+    delay(200);
     mqtt_sent_gate(gate, true); // Send ON to MQTT topic
     delay(200);
     mqtt_sent_gate(gate, false); // Send OFF to MQTT topic
@@ -185,23 +190,22 @@ void setup()
 
   sensor_send_values();   // send sensor values to MQTT server
   mqtt_send_wifi_infos(); // send wifi infos to MQTT server
-  delay(3000);            // wait a bit before going to deepsleep
+  mqtt_publish_config();
+  delay(3000); // wait a bit before going to deepsleep
 
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
   {
-    mqtt_publish_config();
     go_deep_sleep(); // return to deepsleep
+    return;          // never reached
   }
-  else
-  {
-    rainbow_stop();
-    ota_start_server();
-    mqtt_send_loop_state(true);
 
-    if (digitalRead(PIN_LETTER) || digitalRead(PIN_PARCEL))
-    {
-      already_open = true;
-    }
+  rainbow_stop();
+  ota_start_server();
+  mqtt_send_loop_state(true);
+
+  if (digitalRead(PIN_LETTER) || digitalRead(PIN_PARCEL))
+  {
+    already_open = true;
   }
 
   end_boot_time_ms = millis();
@@ -242,6 +246,7 @@ void loop()
   if (TelnetStream.available()) // if there is data on TelnetStream
   {
     char c = TelnetStream.read();
+    logs_enable_telnet(true);
     switch (c)
     {
     case '\n':
