@@ -24,6 +24,7 @@ RTC_DATA_ATTR uint32_t last_boot_time;
 RTC_DATA_ATTR uint32_t boot_count;
 RTC_DATA_ATTR Config config;
 RTC_DATA_ATTR gate_t gate_event_from_loop = GATE_UNKNOWN;
+RTC_DATA_ATTR bool last_gate_open = false;
 
 bool already_open = false;
 static unsigned long loop_time_ms = 0;
@@ -31,6 +32,7 @@ static unsigned long end_boot_time_ms = 0;
 
 void go_deep_sleep()
 {
+  logs("Going to deepsleep...\n");
   mqtt_send_loop_state(false);
   rainbow_stop();
   digitalWrite(PIN_POWER_INA219, LOW);
@@ -43,37 +45,88 @@ void go_deep_sleep()
     esp_sleep_enable_ext1_wakeup(BUTTON_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO27 and 15. More info in config.h in "BUTTON_BITMASK"
   }
 
-  logs("Going to deepsleep...\n");
+  last_gate_open = sensor_is_any_gate_open();
+
   delay(500);
-  gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
-  gpio_deep_sleep_hold_en(); // enable it
+  gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
+  gpio_deep_sleep_hold_en();                   // enable it
 
   esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
   esp_deep_sleep_start();                           // Start the deepsleep
 }
 
-void avoid_multiple_boot()
+gate_t get_boot_gate()
 {
-  if (rtc.getYear() == 1970)
+  char wake_GPIO = log(esp_sleep_get_ext1_wakeup_status()) / log(2);
+  if (wake_GPIO >= 32)
   {
-    return; // RTC not initialized, we cannot avoid multiple boot
+    logs("Wake GPIO is not valid: %d\n", wake_GPIO);
+    wake_GPIO = 0;
   }
 
-  if (last_boot_time + 60 > rtc.getEpoch())
+  gate_t gate = GATE_UNKNOWN;
+  logs("Wake GPIO: %d\n", wake_GPIO);
+  switch (wake_GPIO)
   {
-    logs("Restart in 1 minute\n");
-    gpio_hold_en(GPIO_NUM_32); // hold the current state of pin 32 durring the deepsleep (LED)
-    gpio_deep_sleep_hold_en(); // enable it
+  case PIN_LETTER:
+    gate = GATE_LETTER;
+    break;
+  case PIN_PARCEL:
+    gate = GATE_PARCEL;
+    break;
+  case PIN_PIR:
+    gate = GATE_PIR;
+    break;
+  default:
+    if (gate_event_from_loop < GATE_UNKNOWN)
+    {
+      logs("Wake event from loop: %d\n", gate_event_from_loop);
+      gate = gate_event_from_loop;
+      gate_event_from_loop = GATE_UNKNOWN; // reset the event from loop
+    }
+    break;
+  }
+
+  return gate;
+}
+
+void avoid_multiple_boot()
+{
+  if (last_gate_open && sensor_is_any_gate_open())
+  {
+    logs("Avoiding multiple boot: a gate is open, going to deepsleep...\n");
+    gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
+    gpio_deep_sleep_hold_en();                   // enable it
     digitalWrite(PIN_POWER_INA219, LOW);
-    esp_sleep_enable_timer_wakeup(1 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
+    esp_sleep_enable_timer_wakeup(1 * 60 * 1000000);
     esp_deep_sleep_start();
   }
+  else
+  {
+    logs("Avoiding multiple boot: no gate is open, continuing...\n");
+  }
+
+  if ((rtc.getYear() != 1970 && (last_boot_time + 60 > rtc.getEpoch())))
+  {
+    logs("Avoiding multiple boot by rtc, going to deepsleep...\n");
+    gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
+    gpio_deep_sleep_hold_en();                   // enable it
+    digitalWrite(PIN_POWER_INA219, LOW);
+    esp_sleep_enable_timer_wakeup(1 * 60 * 1000000);
+    esp_deep_sleep_start();
+  }
+
   last_boot_time = rtc.getEpoch();
 }
 
 void setup()
 {
   logs_init();
+  if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1)
+  {
+    avoid_multiple_boot();
+  }
+
   rainbow_init();
   sensor_init();
   buzzer_init();
@@ -83,36 +136,29 @@ void setup()
 
   boot_count++;
 
-  if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1)
-  {
-    avoid_multiple_boot();
-  }
-
-  char wake_GPIO = log(esp_sleep_get_ext1_wakeup_status()) / log(2);
-  if (wake_GPIO >= 32)
-  {
-    logs("Wake GPIO is not valid: %d\n", wake_GPIO);
-    wake_GPIO = 0;
-  }
-
-  if (wake_GPIO == PIN_LETTER || wake_GPIO == PIN_PARCEL)
-  {
-    rainbow_start();
-  }
+  gate_t gate = get_boot_gate();
+  logs("Gate: %d %d\n", gate, gate_event_from_loop);
 
   logs("Connecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Connect to the Wifi
   int wifi_timeout = millis() + 20000;  // Get time before begin to connect
+  status_led_set_state(STATUS_LED_CONNECTING);
+
+  if (gate <= GATE_PARCEL)
+  {
+    rainbow_start();
+  }
+
   while (WiFi.status() != WL_CONNECTED)
   {
     logs(".");
-    // digitalWrite(PIN_STATUS_PARCEL, !digitalRead(PIN_STATUS_PARCEL));
     if (millis() > wifi_timeout) // Timeout of 30s
     {
       go_deep_sleep(); // stop trying to connect and go deepsleep
     }
     delay(500);
   }
+  status_led_set_state(STATUS_LED_COPY_GATES);
 
   IPAddress ip = WiFi.localIP();
   logs("\nWiFi connected: %s\n", ip.toString().c_str());
@@ -151,32 +197,9 @@ void setup()
 
   mqtt_send_boot_count(boot_count);
 
-  gate_t gate = GATE_UNKNOWN;
-  logs("Wake GPIO: %d\n", wake_GPIO);
-  switch (wake_GPIO)
-  {
-  case PIN_LETTER:
-    gate = GATE_LETTER;
-    break;
-  case PIN_PARCEL:
-    gate = GATE_PARCEL;
-    break;
-  case PIN_PIR:
-    gate = GATE_PIR;
-    break;
-  default:
-    if (gate_event_from_loop < GATE_UNKNOWN)
-    {
-      logs("Wake event from loop: %d\n", gate_event_from_loop);
-      gate = gate_event_from_loop;
-    }
-    break;
-  }
-
-  logs("Gate: %d\n", gate);
-
   if (gate != GATE_UNKNOWN)
   {
+    logs("Sending gate state to MQTT: %d\n", gate);
     mqtt_sent_gate(gate, false); // Send OFF to MQTT topic
     delay(200);
     mqtt_sent_gate(gate, true); // Send ON to MQTT topic
@@ -190,8 +213,9 @@ void setup()
 
   sensor_send_values();   // send sensor values to MQTT server
   mqtt_send_wifi_infos(); // send wifi infos to MQTT server
-  mqtt_publish_config();
-  delay(3000); // wait a bit before going to deepsleep
+  // mqtt_publish_config();
+
+  delay(5000); // wait a bit before going to deepsleep
 
   if (config.deepSleep == 1 || config.deepSleep == -1) // If deepsleep is enabled or config not loaded
   {
@@ -219,7 +243,9 @@ void loop()
   {
     gate_event_from_loop = (letter ? GATE_LETTER : GATE_PARCEL);
     logs("Detected %s, restarting...\n", (letter ? "letter" : "parcel"));
-    ESP.restart();
+    // ESP.restart();
+    esp_sleep_enable_timer_wakeup(100000); // 100ms restart to process the detection
+    esp_deep_sleep_start();
   }
 
   sensor_send_gates_states(); // send gates states to MQTT server

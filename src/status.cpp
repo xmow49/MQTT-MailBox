@@ -6,7 +6,7 @@
 #include "config.h"
 
 TaskHandle_t status_led_task_handle = NULL;
-
+status_led_state_t current_status_led_state = STATUS_LED_COPY_GATES;
 static void status_led_task(void *pvParameters)
 {
     pinMode(PIN_PARCEL, INPUT);
@@ -19,9 +19,23 @@ static void status_led_task(void *pvParameters)
 
     for (;;)
     {
-        digitalWrite(PIN_STATUS_PARCEL, digitalRead(PIN_PARCEL));
-        digitalWrite(PIN_STATUS_LETTER, digitalRead(PIN_LETTER));
-        vTaskDelay(pdMS_TO_TICKS(100));
+        switch (current_status_led_state)
+        {
+        case STATUS_LED_COPY_GATES:
+
+            digitalWrite(PIN_STATUS_PARCEL, digitalRead(PIN_PARCEL));
+            digitalWrite(PIN_STATUS_LETTER, digitalRead(PIN_LETTER));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+        case STATUS_LED_CONNECTING:
+            digitalWrite(PIN_STATUS_PARCEL, !digitalRead(PIN_STATUS_PARCEL));
+            digitalWrite(PIN_STATUS_LETTER, LOW);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            break;
+        default:
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+        }
     }
 }
 
@@ -32,4 +46,9 @@ void status_led_init()
     {
         Serial.println("Failed to create status LED task");
     }
+}
+
+void status_led_set_state(status_led_state_t state)
+{
+    current_status_led_state = state;
 }

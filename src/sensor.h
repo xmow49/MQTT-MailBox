@@ -12,3 +12,4 @@ void sensor_init();
 void sensor_send_values();
 void sensor_set_charge(uint32_t value_mWh);
 void sensor_send_gates_states();
+bool sensor_is_any_gate_open();

@@ -25,18 +25,19 @@ RTC_DATA_ATTR float storage_energy_mWh = 0;
 void sensor_init()
 {
     pinMode(PIN_POWER_INA219, OUTPUT); // Power INA219
-    pinMode(PIN_PIR, INPUT);           // temporary, to avoid data pin as GND
-
     digitalWrite(PIN_POWER_INA219, HIGH);
 
-    if (!solar_pannel_meter.begin())
-    {
-        logs("Failed to initialize INA219 solar_pannel_meter\n");
-    }
+    pinMode(PIN_PIR, INPUT); // temporary, to avoid data pin as GND
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for INA219 to power up
 
     if (!battery_meter.begin())
     {
         logs("Failed to initialize INA219 battery_meter\n");
+    }
+    if (!solar_pannel_meter.begin())
+    {
+        logs("Failed to initialize INA219 solar_pannel_meter\n");
     }
 
     solar_pannel_meter.setCalibration_32V_1A();
@@ -129,4 +130,12 @@ void sensor_send_gates_states()
         letter = new_letter;
         mqtt_sent_gate(GATE_LETTER, new_letter);
     }
+}
+
+bool sensor_is_any_gate_open()
+{
+    bool parcel = digitalRead(PIN_PARCEL);
+    bool letter = digitalRead(PIN_LETTER);
+    bool pir = digitalRead(PIN_PIR);
+    return (parcel || letter || pir);
 }

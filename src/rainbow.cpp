@@ -41,6 +41,8 @@ static void rainbow_animation_task(void *pvParameters)
 {
     long firstPixelHue = 0;
     digitalWrite(PIN_RAINBOW_POWER, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     rainbow_led.begin();
     rainbow_led.setBrightness(config.brightness);
 
