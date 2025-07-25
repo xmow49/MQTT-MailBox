@@ -14,6 +14,7 @@
 #include "buzzer.h"
 #include "ota.h"
 #include "mqtt.h"
+#include "esp_wifi.h"
 
 #include "time.h"
 #include "config.h" //pins file
@@ -29,6 +30,24 @@ RTC_DATA_ATTR bool last_gate_open = false;
 bool already_open = false;
 static unsigned long loop_time_ms = 0;
 static unsigned long end_boot_time_ms = 0;
+
+TaskHandle_t watchdog_task_handle = NULL;
+
+void set_max_power(bool state)
+{
+  if (state)
+  {
+    pinMode(PIN_MAX_POWER, OUTPUT); // LED Pin is OUTPUT
+    digitalWrite(PIN_MAX_POWER, HIGH);
+    gpio_hold_dis((gpio_num_t)PIN_MAX_POWER); // disable holding state of GPIO32
+  }
+  else
+  {
+    pinMode(PIN_MAX_POWER, OUTPUT); // LED Pin is OUTPUT
+    digitalWrite(PIN_MAX_POWER, LOW);
+    gpio_hold_en((gpio_num_t)PIN_MAX_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
+  }
+}
 
 void go_deep_sleep()
 {
@@ -48,11 +67,11 @@ void go_deep_sleep()
   last_gate_open = sensor_is_any_gate_open();
 
   delay(500);
-  gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
-  gpio_deep_sleep_hold_en();                   // enable it
+  set_max_power(false);
+  gpio_deep_sleep_hold_en();
 
-  esp_sleep_enable_timer_wakeup(10 * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
-  esp_deep_sleep_start();                           // Start the deepsleep
+  esp_sleep_enable_timer_wakeup(PERIODIC_SEND_MINUTES * 60 * 1000000); // Every 10 minutes, send temperature, battery ...
+  esp_deep_sleep_start();                                              // Start the deepsleep
 }
 
 gate_t get_boot_gate()
@@ -87,6 +106,26 @@ gate_t get_boot_gate()
     break;
   }
 
+  if (gate == GATE_UNKNOWN)
+  {
+    bool letter = digitalRead(PIN_LETTER);
+    bool parcel = digitalRead(PIN_PARCEL);
+    bool pir = digitalRead(PIN_PIR);
+    logs("No gate detected, using pins read: letter=%d, parcel=%d, pir=%d\n", letter, parcel, pir);
+    if (parcel)
+    {
+      gate = GATE_PARCEL;
+    }
+    else if (letter)
+    {
+      gate = GATE_LETTER;
+    }
+    else if (pir)
+    {
+      gate = GATE_PIR;
+    }
+  }
+
   return gate;
 }
 
@@ -95,8 +134,8 @@ void avoid_multiple_boot()
   if (last_gate_open && sensor_is_any_gate_open())
   {
     logs("Avoiding multiple boot: a gate is open, going to deepsleep...\n");
-    gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
-    gpio_deep_sleep_hold_en();                   // enable it
+    set_max_power(false);
+    gpio_deep_sleep_hold_en();
     digitalWrite(PIN_POWER_INA219, LOW);
     esp_sleep_enable_timer_wakeup(1 * 60 * 1000000);
     esp_deep_sleep_start();
@@ -109,8 +148,8 @@ void avoid_multiple_boot()
   if ((rtc.getYear() != 1970 && (last_boot_time + 60 > rtc.getEpoch())))
   {
     logs("Avoiding multiple boot by rtc, going to deepsleep...\n");
-    gpio_hold_en((gpio_num_t)PIN_RAINBOW_POWER); // hold the current state of pin 32 durring the deepsleep (LED)
-    gpio_deep_sleep_hold_en();                   // enable it
+    set_max_power(false);
+    gpio_deep_sleep_hold_en();
     digitalWrite(PIN_POWER_INA219, LOW);
     esp_sleep_enable_timer_wakeup(1 * 60 * 1000000);
     esp_deep_sleep_start();
@@ -119,13 +158,24 @@ void avoid_multiple_boot()
   last_boot_time = rtc.getEpoch();
 }
 
+void watchdog_task(void *pvParameters)
+{
+  vTaskDelay(pdMS_TO_TICKS(WATCHDOG_SETUP_TIMEOUT_S * 1000));
+  logs("Watchdog task triggered, going to deepsleep...\n");
+  go_deep_sleep();   // if the watchdog is triggered, go to deepsleep
+  vTaskDelete(NULL); // delete the task
+}
+
 void setup()
 {
+  set_max_power(true);
   logs_init();
   if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1)
   {
     avoid_multiple_boot();
   }
+
+  xTaskCreatePinnedToCore(watchdog_task, "watchdog", 4096, NULL, 23, &watchdog_task_handle, 1);
 
   rainbow_init();
   sensor_init();
@@ -136,10 +186,22 @@ void setup()
 
   boot_count++;
 
+  if (esp_reset_reason() == ESP_RST_BROWNOUT)
+  {
+    logs("Brownout detected, setting status LED to BROWNOUT\n");
+    status_led_set_state(STATUS_LED_BROWNOUT);
+    vTaskDelay(pdMS_TO_TICKS(3000)); // wait a bit to show the brownout state
+  }
+  else
+  {
+    vTaskDelay(pdMS_TO_TICKS(500)); // wait a bit before starting the rainbow animation
+  }
+
   gate_t gate = get_boot_gate();
   logs("Gate: %d %d\n", gate, gate_event_from_loop);
 
   logs("Connecting to %s", WIFI_SSID);
+  esp_wifi_set_max_tx_power(32);        // Set max TX power to 46 dBm (default is 20 dBm --> 86)
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Connect to the Wifi
   int wifi_timeout = millis() + 20000;  // Get time before begin to connect
   status_led_set_state(STATUS_LED_CONNECTING);
@@ -233,6 +295,8 @@ void setup()
   }
 
   end_boot_time_ms = millis();
+
+  vTaskSuspend(watchdog_task_handle); // suspend the watchdog task, we don't need it anymore
 }
 
 void loop()
@@ -276,19 +340,29 @@ void loop()
     switch (c)
     {
     case '\n':
+      TelnetStream.println("=====================");
       TelnetStream.println("BoiteAuxLettres");
       TelnetStream.println("L: Show startup logs");
       TelnetStream.println("R: Start rainbow");
       TelnetStream.println("S: Stop rainbow");
+      TelnetStream.println("O: Restart ESP");
+      TelnetStream.println("=====================");
+      TelnetStream.println();
+
       break;
     case 'L':
+      TelnetStream.println("-----------------------------------------------");
       TelnetStream.println(logs_get_buffer(false));
+      TelnetStream.println("-----------------------------------------------");
       break;
     case 'R':
       rainbow_start();
       break;
     case 'S':
       rainbow_stop();
+      break;
+    case 'O':
+      ESP.restart();
       break;
     default:
       break;

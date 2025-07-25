@@ -17,6 +17,8 @@ static void status_led_task(void *pvParameters)
     digitalWrite(PIN_STATUS_LETTER, LOW);
     digitalWrite(PIN_STATUS_PARCEL, LOW);
 
+    bool status = false;
+
     for (;;)
     {
         switch (current_status_led_state)
@@ -31,6 +33,12 @@ static void status_led_task(void *pvParameters)
             digitalWrite(PIN_STATUS_PARCEL, !digitalRead(PIN_STATUS_PARCEL));
             digitalWrite(PIN_STATUS_LETTER, LOW);
             vTaskDelay(pdMS_TO_TICKS(500));
+            break;
+        case STATUS_LED_BROWNOUT:
+            digitalWrite(PIN_STATUS_PARCEL, status);
+            digitalWrite(PIN_STATUS_LETTER, !status);
+            status = !status;
+            vTaskDelay(pdMS_TO_TICKS(300));
             break;
         default:
             vTaskDelay(pdMS_TO_TICKS(100));

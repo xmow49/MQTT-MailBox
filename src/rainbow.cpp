@@ -12,11 +12,8 @@ static void rainbow_animation_task(void *pvParameters);
 
 void rainbow_init()
 {
-    pinMode(PIN_RAINBOW_DATA, INPUT);             // temporary, to avoid data pin as GND
-    pinMode(PIN_RAINBOW_POWER, OUTPUT);           // LED Pin is OUTPUT
-    digitalWrite(PIN_RAINBOW_POWER, LOW);         // turn off the power to the rainbow LED
-    gpio_hold_dis((gpio_num_t)PIN_RAINBOW_POWER); // disable holding state of GPIO32
-    gpio_deep_sleep_hold_dis();                   // disbale holding
+    pinMode(PIN_RAINBOW_DATA, INPUT); // temporary, to avoid data pin as GND
+    gpio_deep_sleep_hold_dis();       // disbale holding
 }
 
 void rainbow_start()
@@ -28,7 +25,7 @@ void rainbow_start()
 
     logs("Starting rainbow animation\n");
 
-    xTaskCreatePinnedToCore(rainbow_animation_task, "rainbow", 4096, NULL, 10, &rainbow_task, 1);
+    xTaskCreatePinnedToCore(rainbow_animation_task, "rainbow", 4096, NULL, 15, &rainbow_task, 1);
     buzzer_play_melody();
     if (rainbow_task == NULL)
     {
@@ -40,7 +37,6 @@ void rainbow_start()
 static void rainbow_animation_task(void *pvParameters)
 {
     long firstPixelHue = 0;
-    digitalWrite(PIN_RAINBOW_POWER, HIGH);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     rainbow_led.begin();
@@ -79,7 +75,7 @@ void rainbow_stop()
     rainbow_led.clear();
     rainbow_led.show();
     delay(100);
-    digitalWrite(PIN_RAINBOW_POWER, LOW);
+    digitalWrite(PIN_MAX_POWER, LOW);
     digitalWrite(PIN_RAINBOW_DATA, LOW);
     pinMode(PIN_RAINBOW_DATA, INPUT); // disable data led to cut the power (use the data pin as GND)
 }
