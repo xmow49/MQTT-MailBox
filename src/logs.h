@@ -1,8 +1,6 @@
 #pragma once
 #include <Arduino.h>
 
-#define DEBUG true
-
 void logs_init();
 
 void logs(const char *format, ...);

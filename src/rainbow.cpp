@@ -12,8 +12,10 @@ static void rainbow_animation_task(void *pvParameters);
 
 void rainbow_init()
 {
-    pinMode(PIN_RAINBOW_DATA, INPUT); // temporary, to avoid data pin as GND
-    gpio_deep_sleep_hold_dis();       // disbale holding
+    // pinMode(PIN_RAINBOW_DATA, INPUT); // temporary, to avoid data pin as GND
+    gpio_deep_sleep_hold_dis(); // disbale holding
+    rainbow_led.begin();
+    rainbow_led.clear();
 }
 
 void rainbow_start()
@@ -75,7 +77,6 @@ void rainbow_stop()
     rainbow_led.clear();
     rainbow_led.show();
     delay(100);
-    digitalWrite(PIN_MAX_POWER, LOW);
     digitalWrite(PIN_RAINBOW_DATA, LOW);
     pinMode(PIN_RAINBOW_DATA, INPUT); // disable data led to cut the power (use the data pin as GND)
 }

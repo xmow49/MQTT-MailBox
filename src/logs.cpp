@@ -1,6 +1,7 @@
 #include "logs.h"
 #include <stdarg.h>
 #include <TelnetStream.h>
+#include "config.h"
 
 static char logs_buffer[8 * 1024];
 static uint32_t logs_index = 0;
@@ -27,7 +28,7 @@ void logs(const char *format, ...)
     Serial.print(buffer);
 #endif
 
-    if (telnet_enabled && TelnetStream.available())
+    if (telnet_enabled)
     {
         TelnetStream.print(buffer);
     }

@@ -86,12 +86,16 @@ static void mqtt_new_message(char *topic, byte *payload, unsigned int length)
     {
         if (length > 5)
             return;
-        if (length == 2)
-            for (int i = 2; i < 5; i++)
-                payload[i] = '\0';
+        payload[length] = '\0'; // Ensure null-termination
+
         uint32_t value = atoi((char *)payload);
+        if (value == 0) // Assuming max charge is 1MWh
+        {
+            return;
+        }
         sensor_set_charge(value);
         logs("New charge config: %d\n", value);
+        mqtt_client.publish(TOPIC_CONFIG_CHARGE, "0", true); // Reset the charge config to 0 after setting it
     }
     if (strcmp(topic, TOPIC_CONFIG_PIR) == 0)
     {
@@ -173,6 +177,15 @@ static void mqtt_task(void *pvParameters)
 {
     while (true)
     {
+        if (!mqtt_client.connected())
+        {
+            logs("MQTT client not connected, reconnecting...\n");
+            if (!mqtt_client.connect("BoiteAuxLettres", MQTT_USER, MQTT_PASSWORD)) // Reconnect to MQTT server
+            {
+                logs("Failed to reconnect to MQTT server, state: %d\n", mqtt_client.state());
+            }
+        }
+
         mqtt_client.loop();
         vTaskDelay(100 / portTICK_PERIOD_MS); // Check MQTT messages every 100ms
     }
@@ -189,7 +202,7 @@ void mqtt_send_temp_hum(float temp, float hum)
     mqtt_client.publish(TOPIC_HUM, String(hum).c_str());
 }
 
-void mqtt_publish_meter(meter_t meter, float voltage, float current_ma, float power_mw, float energy_mwh, float storage_energy_mwh)
+void mqtt_publish_meter(meter_t meter, float voltage, float current_ma, float power_mw, float energy_mwh)
 {
     const char *str_meter = NULL;
     switch (meter)
@@ -224,9 +237,7 @@ void mqtt_publish_meter(meter_t meter, float voltage, float current_ma, float po
     snprintf(value, sizeof(value), "%.2f", energy_mwh);
     mqtt_client.publish(topic, value);
 
-    snprintf(topic, sizeof(topic), TOPIC_CHARGE, str_meter);
-    snprintf(value, sizeof(value), "%.2f", storage_energy_mwh);
-    mqtt_client.publish(topic, value);
+    logs("Published %s: voltage=%.2f, current=%.2f, power=%.2f, energy=%.2f\n", str_meter, voltage, current_ma, power_mw, energy_mwh);
 }
 
 void mqtt_send_boot_count(uint32_t boot_count)

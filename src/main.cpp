@@ -64,6 +64,9 @@ void go_deep_sleep()
     esp_sleep_enable_ext1_wakeup(BUTTON_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH); // set pin to wake, here GPIO27 and 15. More info in config.h in "BUTTON_BITMASK"
   }
 
+  EEPROM.put(0, config); // write config to EEPROM
+  EEPROM.commit();
+
   last_gate_open = sensor_is_any_gate_open();
 
   delay(500);
@@ -168,12 +171,16 @@ void watchdog_task(void *pvParameters)
 
 void setup()
 {
-  set_max_power(true);
   logs_init();
   if (config.avoidMultipleBoot == 1 || config.avoidMultipleBoot == -1)
   {
     avoid_multiple_boot();
   }
+
+  EEPROM.begin(512);
+  EEPROM.get(0, config); // read config from EEPROM
+
+  set_max_power(true);
 
   xTaskCreatePinnedToCore(watchdog_task, "watchdog", 4096, NULL, 23, &watchdog_task_handle, 1);
 
@@ -181,8 +188,6 @@ void setup()
   sensor_init();
   buzzer_init();
   status_led_init();
-  EEPROM.begin(512);
-  EEPROM.get(0, config); // read config from EEPROM
 
   boot_count++;
 
